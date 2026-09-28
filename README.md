@@ -5,28 +5,6 @@ gripper commands from camera images and language instructions. It alternates
 policy calls with spline-prefix execution. Longer query intervals
 execute more actions between predictions; shorter intervals refresh sooner.
 
-## Corrected training path
-
-1. Build nonuniform knot targets by inverse cumulative complexity density. High
-   local acceleration or criticality produces shorter spans, with a true minimum
-   span bound. Actual demonstration timestamp widths are used.
-2. Predict knots from the observation and physical horizon. **Refit flow targets on those predicted
-   knots every batch**, and condition the flow model on the knots and horizon.
-   Cached control points from a different basis are not used by the loss.
-3. Train `freq_head` with squared error between log predicted and log target query
-   intervals. This is in addition to knot KL/entropy, flow matching, and separate
-   gripper binary cross-entropy losses. The KL direction is `KL(target || prediction)`.
-4. Use measured `query_intervals` when supplied. Otherwise use an explicit
-   heuristic teacher: near-constant velocity permits the maximum prefix; motion
-   variation shifts timing toward the first physical knot span. Criticality and
-   gripper-event timestamps can shorten the interval. This is **not** a measured
-   manipulation-error tolerance or evidence of precision improvement.
-
-The physical horizon is supplied from training timestamps and an explicit
-inference configuration, rather than predicted by an unsupervised duration head.
-The checkpoint records its default horizon. No speed-rescaling invariance is
-assumed when requesting a different horizon.
-
 ## Action and dataset contract
 
 Each input arm has exactly seven channels. Declare these HDF5 attributes (on the
@@ -135,14 +113,3 @@ first/second derivatives. For a velocity spline these mean velocity, acceleratio
 and jerk. It requires the new horizon for correct scaling and rejects a second
 derivative without a first derivative. It is not applied automatically by the
 executor and does not guarantee actual robot tracking or zero jerk.
-
-## Validation status
-
-The tests exercise numerical spline correctness, timing gradients and learning,
-data validation, unit conversion, discrete grippers, backbone interfaces, and
-sequential execution. Evaluation scripts are synthetic smoke checks, not robot
-benchmark rollouts. They report query counts, wall time, and separate linear and
-angular jerk energies. The paper's unsupported performance tables have been
-replaced by a proposed evaluation protocol. No task-success, precision, GPU-cost,
-or compute-saving result is claimed. See [REVIEW.md](REVIEW.md) for the resolution
-of each review finding and remaining empirical validation limits.
