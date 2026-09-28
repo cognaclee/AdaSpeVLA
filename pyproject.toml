@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaspevla"
+version = "0.1.0"
+description = "AdaSpeVLA: Learnable Knot Placement B-Spline VLA Policy for Adaptive Prediction-Frequency Robotic Manipulation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "transformers>=4.45.0",
+    "accelerate>=0.30.0",
+    "peft>=0.11.0",
+    "timm>=1.0.0",
+    "h5py>=3.10.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "einops>=0.8.0",
+    "matplotlib>=3.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "black>=24.0.0",
+    "flake8>=7.0.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["adaspevla*"]
