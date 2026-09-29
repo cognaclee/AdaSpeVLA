@@ -1,6 +1,8 @@
 """Strict task-scoped HDF5 loading and explicitly requested synthetic test data."""
 
 from pathlib import Path
+from io import BytesIO
+from PIL import Image
 import h5py
 import numpy as np
 from .bspline_dataset import UniversalBSplineDataset
@@ -65,6 +67,51 @@ def _array(group, paths, required=True):
     return None
 
 
+def read_rgb_camera(group, path, robotwin_codec=False):
+    """Read decoded RGB arrays or individually encoded JPEG/PNG frames."""
+    values = _array(group, [path])
+    if values.ndim == 4 and (values.shape[-1] == 3 or values.shape[1] == 3):
+        return values if values.shape[-1] == 3 else values.transpose(0, 2, 3, 1)
+    if values.ndim != 1 or values.dtype.kind not in ("S", "O"):
+        raise ValueError(
+            f"{path}: expected RGB arrays or a one-dimensional encoded-frame dataset"
+        )
+    frames = []
+    for index in range(len(values)):
+        # A slice retains all fixed-width bytes, including terminal NUL bytes.
+        blob = (
+            values[index : index + 1].tobytes()
+            if values.dtype.kind == "S"
+            else values[index]
+        )
+        if isinstance(blob, np.ndarray):
+            blob = blob.tobytes()
+        if not isinstance(blob, (bytes, bytearray)):
+            raise ValueError(f"{path} frame {index}: expected encoded image bytes")
+        try:
+            with Image.open(BytesIO(blob)) as image:
+                frame = np.asarray(image.convert("RGB"))
+                if robotwin_codec:
+                    # Official codec: unmarked legacy buffers store reversed RGB;
+                    # XPL-RGB1 JPEG COM marks standard-order encoded RGB.
+                    marked = any(
+                        kind == "COM" and payload == b"XPL-RGB1"
+                        for kind, payload in getattr(image, "applist", [])
+                    )
+                    if not marked:
+                        frame = frame[..., ::-1].copy()
+                frames.append(frame)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"{group.file.filename}:{path} frame {index}: could not decode image"
+            ) from exc
+    if not frames or any(frame.shape != frames[0].shape for frame in frames):
+        raise ValueError(
+            f"{path}: empty camera stream or inconsistent image resolution"
+        )
+    return np.stack(frames)
+
+
 def load_hdf5_dataset(
     data_dir,
     task_name,
@@ -78,8 +125,21 @@ def load_hdf5_dataset(
     camera_paths=None,
     images_path=None,
     actions_path=None,
+    robotwin_native_right=False,
+    robotwin_base_wxyz=None,
+    robotwin_gripper_threshold=0.5,
+    robotwin_simulation_dt=1 / 250,
     **overrides,
 ):
+    if robotwin_native_right:
+        if benchmark != "robotwin" or action_dim != 7 or actions_path or images_path:
+            raise ValueError(
+                "Native right-arm mode requires RoboTwin single-arm input and no action/image path override"
+            )
+        camera_paths = camera_paths or [
+            "vision/cam_head/colors",
+            "vision/cam_right_wrist/colors",
+        ]
     if camera_paths is not None:
         if (
             isinstance(camera_paths, str)
@@ -141,18 +201,11 @@ def load_hdf5_dataset(
                             f"{path}: task metadata {declared_task!r} does not match {task_name!r}"
                         )
                     if camera_paths is not None:
-                        views = [_array(group, [name]) for name in camera_paths]
-                        if any(
-                            view.ndim != 4
-                            or (view.shape[-1] != 3 and view.shape[1] != 3)
-                            for view in views
-                        ):
-                            raise ValueError(
-                                "camera_paths must select decoded RGB arrays (T,H,W,3) or (T,3,H,W); compressed image bytes require decoding before loading"
-                            )
                         views = [
-                            view if view.shape[-1] == 3 else view.transpose(0, 2, 3, 1)
-                            for view in views
+                            read_rgb_camera(
+                                group, name, robotwin_codec=robotwin_native_right
+                            )
+                            for name in camera_paths
                         ]
                         if any(view.shape != views[0].shape for view in views):
                             raise ValueError(
@@ -173,6 +226,56 @@ def load_hdf5_dataset(
                         )
                         wrist = _array(group, ["obs/robot0_eye_in_hand_image"])
                         images = np.stack((head, wrist), axis=1)
+                    if robotwin_native_right:
+                        from .robotwin_native import native_right_episode
+
+                        for key, expected in {
+                            "action_type": "twist",
+                            "action_frame": "base",
+                            "gripper_open_value": 1.0,
+                            "gripper_closed_value": 0.0,
+                        }.items():
+                            if (
+                                overrides.get(key) is not None
+                                and overrides[key] != expected
+                            ):
+                                raise ValueError(
+                                    f"Native conversion sets {key}={expected}; conflicting override"
+                                )
+                        ep = native_right_episode(
+                            group,
+                            images,
+                            sample_dt=overrides.get("sample_dt"),
+                            base_wxyz=robotwin_base_wxyz,
+                            gripper_threshold=robotwin_gripper_threshold,
+                            simulation_dt=robotwin_simulation_dt,
+                        )
+                        for key in (
+                            "criticality",
+                            "query_intervals",
+                            "terminated",
+                            "dones",
+                        ):
+                            if key in group:
+                                ep[key] = np.asarray(group[key])
+                        if "termination_time" in group.attrs:
+                            ep["termination_time"] = float(
+                                group.attrs["termination_time"]
+                            )
+                        episodes.append(ep)
+                        continue
+                    if (
+                        actions_path is None
+                        and "action/left_ee_poses" in group
+                        and "action/right_ee_poses" in group
+                    ):
+                        raise ValueError(
+                            f"{path}: this export contains per-arm pose/joint targets, not physical twist actions. "
+                            "Camera decoding is supported, but pose-to-twist conversion requires the "
+                            "quaternion order, reference frame, action/state time alignment and gripper "
+                            "coding. Do not pass an ee_poses dataset as --actions_path. "
+                            "Provide a converted twist dataset and select it with --actions_path."
+                        )
                     actions = _array(
                         group, [actions_path] if actions_path else ["actions", "action"]
                     )
@@ -182,7 +285,7 @@ def load_hdf5_dataset(
                             root.attrs.get("instruction", f"perform {task_name}"),
                         )
                     )
-                    for key in ("instruction", "ep_meta/lang"):
+                    for key in ("instruction", "instructions", "ep_meta/lang"):
                         if key in group:
                             instruction = _decode(group[key][()])
                             break
@@ -206,6 +309,26 @@ def load_hdf5_dataset(
                             )
                         if supplied is not None or recorded is not None:
                             ep[key] = supplied if supplied is not None else recorded
+                    frequency = _array(
+                        group, ["additional_info/frequency"], required=False
+                    )
+                    if frequency is not None:
+                        if (
+                            frequency.ndim != 0
+                            or not np.isfinite(frequency)
+                            or frequency <= 0
+                        ):
+                            raise ValueError(
+                                "additional_info/frequency must be a positive scalar Hz value"
+                            )
+                        period = 1.0 / float(frequency)
+                        if "sample_dt" in ep and not np.isclose(
+                            ep["sample_dt"], period
+                        ):
+                            raise ValueError(
+                                "sample_dt conflicts with additional_info/frequency"
+                            )
+                        ep["sample_dt"] = period
                     for key in (
                         "timestamps",
                         "action_durations",

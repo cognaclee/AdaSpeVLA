@@ -132,6 +132,15 @@ class UniversalBSplineDataset(Dataset):
             motion_channels=["vx", "vy", "vz", "wx", "wy", "wz"],
             motion_units=["m/s"] * 3 + ["rad/s"] * 3,
         )
+        conversions = [
+            ep["conversion_metadata"]
+            for ep, _, _, _ in prepared
+            if "conversion_metadata" in ep
+        ]
+        if conversions:
+            if any(meta != conversions[0] for meta in conversions):
+                raise ValueError("Native conversion conventions differ across episodes")
+            self.calibration["source_conversion"] = conversions[0]
         for ep, motion, gripper, times in prepared:
             images = np.asarray(ep["images"])
             if len(images) != len(motion):

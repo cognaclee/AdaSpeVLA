@@ -98,6 +98,20 @@ def parse_args():
         "--actions_path",
         help="Converted physical action dataset path; does not convert joint/pose commands",
     )
+    parser.add_argument(
+        "--robotwin_native_right",
+        action="store_true",
+        help="Decode native RoboTwin v1 export and convert right-arm state/action poses",
+    )
+    parser.add_argument(
+        "--robotwin_base_wxyz",
+        nargs=4,
+        type=float,
+        default=None,
+        help="Robot base orientation in world; default is official aloha-agilex",
+    )
+    parser.add_argument("--robotwin_gripper_threshold", type=float, default=0.5)
+    parser.add_argument("--robotwin_simulation_dt", type=float, default=1 / 250)
     add_method_arguments(parser)
     return parser.parse_args()
 
@@ -131,6 +145,10 @@ def train():
         camera_paths=args.camera_paths,
         images_path=args.images_path,
         actions_path=args.actions_path,
+        robotwin_native_right=args.robotwin_native_right,
+        robotwin_base_wxyz=args.robotwin_base_wxyz,
+        robotwin_gripper_threshold=args.robotwin_gripper_threshold,
+        robotwin_simulation_dt=args.robotwin_simulation_dt,
         action_type=args.action_type,
         action_frame=args.action_frame,
         sample_dt=args.sample_dt,
