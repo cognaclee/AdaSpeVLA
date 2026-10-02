@@ -5,7 +5,7 @@ from typing import Callable, Dict, Tuple
 
 import torch
 
-from .bspline.bspline_core import eval_cox_de_boor_basis
+from .bspline.bspline_core import evaluate_bspline
 
 
 class SynchronousSplineExecutor:
@@ -108,10 +108,12 @@ class SynchronousSplineExecutor:
             if (
                 cp.ndim != 3
                 or cp.shape[0] != 1
-                or knots.ndim != 2
+                or knots.ndim not in (2, 3)
                 or knots.shape[0] != 1
             ):
                 raise ValueError("Execution requires a single-observation batch")
+            if knots.ndim == 3 and cp.shape[-1] % knots.shape[1]:
+                raise ValueError("Per-arm knot groups must split the motion channels")
             if not torch.isfinite(cp).all() or not torch.isfinite(knots).all():
                 raise ValueError("Spline parameters must be finite")
             if "gripper_commands" in prediction:
@@ -168,13 +170,10 @@ class SynchronousSplineExecutor:
             [[self.step_index * self.control_dt / self.horizon]],
             dtype=self.control_points.dtype,
         )
-        basis = eval_cox_de_boor_basis(
-            u,
-            self.knots,
-            num_control_points=self.control_points.shape[1],
-            degree=self.policy.degree,
-        )
-        action = torch.bmm(basis, self.control_points)[0, 0]
+        # Shared (1,n) knots or one partition per arm (1,arms,n).
+        action = evaluate_bspline(
+            u, self.knots, self.control_points, self.policy.degree
+        )[0, 0]
         if self.motion_limits is not None:
             if (
                 self.motion_limits.shape != action.shape

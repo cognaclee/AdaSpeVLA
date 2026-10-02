@@ -40,9 +40,14 @@ class LearnableKnotPlacementHead(nn.Module):
         min_interval_eps=0.01,
         min_query_interval=0.02,
         max_query_interval=0.5,
+        num_groups=1,
     ):
         super().__init__()
         self.num_intervals = num_control_points - degree
+        if num_groups < 1:
+            raise ValueError("Require at least one knot group")
+        # num_groups > 1 gives one span distribution per arm from a shared trunk.
+        self.num_groups = num_groups
         if degree < 0 or self.num_intervals < 1 or temperature <= 0:
             raise ValueError("Require K > degree >= 0 and positive temperature")
         if not 0 <= min_interval_eps < 1 / self.num_intervals:
@@ -59,21 +64,24 @@ class LearnableKnotPlacementHead(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, self.num_intervals),
+            nn.Linear(hidden_dim, self.num_intervals * num_groups),
         )
 
     def forward(self, cond, horizon_duration=0.3):
         horizon = duration_tensor(horizon_duration, cond)
-        raw = F.softmax(
-            self.net(torch.cat((cond, horizon.log()), dim=-1)) / self.temperature,
-            dim=-1,
-        )
+        logits = self.net(torch.cat((cond, horizon.log()), dim=-1))
+        if self.num_groups > 1:
+            logits = logits.reshape(-1, self.num_groups, self.num_intervals)
+        raw = F.softmax(logits / self.temperature, dim=-1)
         # This parameter is an actual lower bound, including after normalization.
         delta = (
             self.min_interval_eps
             + (1 - self.num_intervals * self.min_interval_eps) * raw
         )
-        return intervals_to_knots(delta, self.degree), delta
+        if self.num_groups == 1:
+            return intervals_to_knots(delta, self.degree), delta
+        knots = intervals_to_knots(delta.flatten(0, 1), self.degree)
+        return knots.reshape(delta.shape[0], self.num_groups, -1), delta
 
 
 def compute_curvature_density_target(

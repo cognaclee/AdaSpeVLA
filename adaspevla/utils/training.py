@@ -18,10 +18,36 @@ def add_method_arguments(parser):
     parser.add_argument("--scale_floor", type=float, default=1e-6)
     parser.add_argument("--timing_probe_count", type=int, default=16)
     parser.add_argument("--num_ode_steps", type=int, default=15)
+    parser.add_argument(
+        "--per_arm_knots",
+        action="store_true",
+        help="Ablation for two-arm data: one learned knot partition per arm "
+        "(default: one shared partition, as in the manuscript)",
+    )
+    parser.add_argument(
+        "--knot_loss_coeff", type=float, default=0.5, help="alpha in Eq. action_loss"
+    )
+    parser.add_argument(
+        "--flow_loss_coeff", type=float, default=1.0, help="gamma (flow-loss weight)"
+    )
+    parser.add_argument(
+        "--gripper_loss_coeff", type=float, default=1.0, help="eta in Eq. action_loss"
+    )
+    parser.add_argument(
+        "--knot_supervision",
+        choices=["kl", "position"],
+        default="kl",
+        help="Span KL (manuscript default) or the positional loss L_pos",
+    )
+    parser.add_argument(
+        "--uniform_knots",
+        action="store_true",
+        help="Ablation: fixed uniform knots instead of learned knots",
+    )
 
 
 def window_options(args):
-    return {
+    options = {
         key: getattr(args, key)
         for key in (
             "supported_horizons",
@@ -33,6 +59,9 @@ def window_options(args):
             "scale_floor",
         )
     }
+    if getattr(args, "per_arm_knots", False):
+        options["per_arm_knots"] = True
+    return options
 
 
 def train_two_stage(args, dataset, benchmark, action_dim):
@@ -48,6 +77,9 @@ def train_two_stage(args, dataset, benchmark, action_dim):
     )
     if not float(durations.min()) - 1e-7 <= horizon <= float(durations.max()) + 1e-7:
         raise ValueError("Inference horizon must lie in the training-supported range")
+    per_arm_knots = bool(getattr(args, "per_arm_knots", False))
+    if per_arm_knots != getattr(dataset, "per_arm_knots", False):
+        raise ValueError("Dataset span targets and policy knot groups disagree")
     policy = AdaSpeVLAPolicy(
         vlm_name=args.vlm_name,
         num_views=dataset.num_views,
@@ -63,6 +95,12 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         supported_horizon_range=[float(durations.min()), float(durations.max())],
         flow_hidden_dim=48 if args.test_backbone else 384,
         flow_num_layers=1 if args.test_backbone else 6,
+        per_arm_knots=per_arm_knots,
+        knot_loss_coeff=getattr(args, "knot_loss_coeff", 0.5),
+        flow_loss_coeff=getattr(args, "flow_loss_coeff", 1.0),
+        gripper_loss_coeff=getattr(args, "gripper_loss_coeff", 1.0),
+        knot_supervision=getattr(args, "knot_supervision", "kl"),
+        uniform_knots=getattr(args, "uniform_knots", False),
     ).to(args.device)
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_windows

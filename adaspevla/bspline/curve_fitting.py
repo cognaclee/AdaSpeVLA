@@ -88,6 +88,31 @@ def fit_bspline_control_points_least_squares(
     return cp, (N @ cp - actions).square().mean(dim=(1, 2))
 
 
+def fit_bspline_control_points_grouped(
+    actions, num_control_points=8, degree=3, knots=None, query_times=None, **kwargs
+):
+    """Least-squares fit with shared (B,n) or per-group (B,G,n) knots.
+
+    Per-group knots fit each block of D/G channels independently on its own
+    partition; the error is the mean over all channels, as in the shared fit.
+    """
+    if knots is None or knots.ndim < 3:
+        return fit_bspline_control_points_least_squares(
+            actions, num_control_points, degree, knots, query_times=query_times, **kwargs
+        )
+    groups = knots.shape[1]
+    if actions.shape[-1] % groups:
+        raise ValueError("Action channels must split evenly across knot groups")
+    fits = [
+        fit_bspline_control_points_least_squares(
+            block, num_control_points, degree, knots[:, g], query_times=query_times, **kwargs
+        )
+        for g, block in enumerate(actions.chunk(groups, dim=-1))
+    ]
+    cp = torch.cat([fit[0] for fit in fits], dim=-1)
+    return cp, torch.stack([fit[1] for fit in fits], -1).mean(-1)
+
+
 class BSplineCurveFitter(nn.Module):
     def __init__(self, num_control_points=8, degree=3, reg_lambda=1e-4):
         super().__init__()

@@ -36,7 +36,12 @@ class UniversalBSplineDataset(Dataset):
         event_quantile=0.95,
         anticipation_margin=0.0,
         scale_floor=1e-6,
+        per_arm_knots=False,
     ):
+        if per_arm_knots and action_dim != 14:
+            raise ValueError("Per-arm knots require two arms (14 action channels)")
+        # Ablation: one span target per arm, from that arm's own motion.
+        self.per_arm_knots = bool(per_arm_knots)
         if chunk_horizon < 2 or num_control_points <= degree or degree < 0:
             raise ValueError("Invalid chunk or spline dimensions")
         self.chunk_horizon, self.num_control_points, self.degree = (
@@ -132,6 +137,8 @@ class UniversalBSplineDataset(Dataset):
             motion_channels=["vx", "vy", "vz", "wx", "wy", "wz"],
             motion_units=["m/s"] * 3 + ["rad/s"] * 3,
         )
+        if self.per_arm_knots:
+            self.calibration["per_arm_knots"] = True
         conversions = [
             ep["conversion_metadata"]
             for ep, _, _, _ in prepared
@@ -247,25 +254,41 @@ class UniversalBSplineDataset(Dataset):
         risk = torch.tensor(criticality)
         horizon = stamps[-1:].clone()
         normalized = raw / self.motion_scale
-        delta = compute_curvature_density_target(
-            normalized[None],
-            self.num_control_points - self.degree,
-            stamps[None],
-            self.min_interval_eps,
-            criticality=risk[None],
-        )[0]
-        knots = intervals_to_knots(delta[None], self.degree)
+        blocks = normalized.chunk(2, -1) if self.per_arm_knots else (normalized,)
+        delta = torch.stack(
+            [
+                compute_curvature_density_target(
+                    block[None],
+                    self.num_control_points - self.degree,
+                    stamps[None],
+                    self.min_interval_eps,
+                    criticality=risk[None],
+                )[0]
+                for block in blocks
+            ]
+        )
+        # Shared: delta (I,), knots (1,n). Per arm: delta (2,I), knots (1,2,n).
+        knots = intervals_to_knots(delta, self.degree)
+        if self.per_arm_knots:
+            knots = knots[None]
+        else:
+            delta = delta[0]
         query_times = stamps / horizon
         if self.include_diagnostic_targets:
-            cp, _ = fit_bspline_control_points_least_squares(
-                normalized[None],
-                self.num_control_points,
-                self.degree,
-                knots=knots,
-                query_times=query_times[None],
-            )
+            fits = [
+                fit_bspline_control_points_least_squares(
+                    block[None],
+                    self.num_control_points,
+                    self.degree,
+                    knots=knots[:, arm] if self.per_arm_knots else knots,
+                    query_times=query_times[None],
+                )[0]
+                for arm, block in enumerate(blocks)
+            ]
+            cp = torch.cat(fits, dim=-1)
         target_interval = query_interval_target(
-            delta[None],
+            # Span lengths only enter validation; the label comes from events.
+            delta.reshape(-1, delta.shape[-1])[:1],
             horizon,
             self.min_query_interval,
             self.max_query_interval,

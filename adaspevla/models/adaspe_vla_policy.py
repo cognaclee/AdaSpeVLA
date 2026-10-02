@@ -6,7 +6,11 @@ from torch.nn import functional as F
 from .vlm_backbone import MultiCameraVLMBackbone
 from .bspline_flow_policy import BSplineFlowMatchingPolicy
 from ..bspline.bspline_core import BSplineEvaluator
-from ..bspline.learnable_knots import LearnableKnotPlacementHead, duration_tensor
+from ..bspline.learnable_knots import (
+    LearnableKnotPlacementHead,
+    duration_tensor,
+    intervals_to_knots,
+)
 from ..bspline.curve_fitting import fit_bspline_control_points_least_squares
 from ..bspline.continuity_refit import BoundaryRefitter
 from ..datasets.action_contract import validate_motion_scales
@@ -38,14 +42,33 @@ class AdaSpeVLAPolicy(nn.Module):
         timing_probe_count=16,
         timing_num_ode_steps=15,
         supported_horizon_range=None,
+        per_arm_knots=False,
+        flow_loss_coeff=1.0,
+        knot_supervision="kl",
+        uniform_knots=False,
     ):
         super().__init__()
+        if knot_supervision not in ("kl", "position"):
+            raise ValueError("knot_supervision must be 'kl' or 'position'")
+        if not flow_loss_coeff > 0:
+            raise ValueError("flow_loss_coeff must be positive")
+        # Table 1 loss weights (alpha, gamma, eta) = (knot, flow, gripper).
+        self.flow_loss_coeff = float(flow_loss_coeff)
+        # Manuscript default: span KL. "position" is the L_pos alternative.
+        self.knot_supervision = knot_supervision
+        # Ablation: fixed uniform knots instead of the learned knot head.
+        self.uniform_knots = bool(uniform_knots)
         if action_dim not in (7, 14) or prediction_samples < 2:
             raise ValueError(
                 "Require 7 or 14 action channels and at least two prediction samples"
             )
         self.action_dim, self.num_arms = action_dim, action_dim // 7
         self.motion_dim = 6 * self.num_arms
+        if per_arm_knots and self.num_arms != 2:
+            raise ValueError("Per-arm knots require two arms (14 action channels)")
+        # Ablation (not the manuscript default): one knot partition per arm.
+        self.per_arm_knots = bool(per_arm_knots)
+        self.knot_groups = self.num_arms if self.per_arm_knots else 1
         self.num_control_points, self.degree, self.cond_dim = (
             num_control_points,
             degree,
@@ -108,6 +131,15 @@ class AdaSpeVLAPolicy(nn.Module):
             timing_num_ode_steps=timing_num_ode_steps,
             supported_horizon_range=supported_horizon_range,
         )
+        if self.per_arm_knots:
+            self.config["per_arm_knots"] = True
+        # Non-default options only, so existing checkpoints keep their exact config.
+        if self.flow_loss_coeff != 1.0:
+            self.config["flow_loss_coeff"] = self.flow_loss_coeff
+        if self.knot_supervision != "kl":
+            self.config["knot_supervision"] = self.knot_supervision
+        if self.uniform_knots:
+            self.config["uniform_knots"] = True
         self.register_buffer(
             "motion_scale", validate_motion_scales(motion_scale_values, self.num_arms)
         )
@@ -121,9 +153,10 @@ class AdaSpeVLAPolicy(nn.Module):
             min_query_interval=min_query_interval,
             max_query_interval=max_query_interval,
             min_interval_eps=min_interval_eps,
+            num_groups=self.knot_groups,
         )
         # Both generator and discrete gripper head see the exact knots and duration.
-        context_dim = cond_dim + num_control_points + degree + 1 + 1
+        context_dim = cond_dim + self.knot_groups * (num_control_points + degree + 1) + 1
         self.flow_policy = BSplineFlowMatchingPolicy(
             num_control_points,
             self.motion_dim,
@@ -141,7 +174,7 @@ class AdaSpeVLAPolicy(nn.Module):
         timing_dim = (
             cond_dim
             + 1
-            + (num_control_points - degree)
+            + self.knot_groups * (num_control_points - degree)
             + timing_probe_count * self.motion_dim
             + prediction_samples * self.num_arms
         )
@@ -194,7 +227,7 @@ class AdaSpeVLAPolicy(nn.Module):
             (
                 cond,
                 horizon.log(),
-                delta.detach(),
+                delta.detach().flatten(1),
                 motion.flatten(1).detach(),
                 grip_logits.flatten(1).detach(),
             ),
@@ -210,7 +243,7 @@ class AdaSpeVLAPolicy(nn.Module):
         with torch.no_grad():
             cond = self.vlm(batch["images"], instructions=batch["instructions"])
             horizon = duration_tensor(batch["horizon_duration"], cond)
-            knots, delta = self.knot_head(cond, horizon)
+            knots, delta = self._predict_knots(cond, horizon)
             context = self._context(cond, knots, horizon)
             physical_cp = (
                 self.flow_policy.sample(context, num_steps=self.timing_num_ode_steps)
@@ -240,8 +273,63 @@ class AdaSpeVLAPolicy(nn.Module):
             "avg_query_hz": interval.reciprocal().mean().item(),
         }
 
+    def _predict_knots(self, cond, horizon):
+        """Learned knots (Eq. pred_spans), or uniform spans for the ablation."""
+        knots, delta = self.knot_head(cond, horizon)
+        if self.uniform_knots:
+            delta = torch.full_like(delta, 1.0 / delta.shape[-1])
+            flat = intervals_to_knots(delta.reshape(-1, delta.shape[-1]), self.degree)
+            knots = flat.reshape(*delta.shape[:-1], -1)
+        return knots, delta
+
+    def _knot_loss(self, delta, target_delta):
+        """alpha-weighted span supervision: KL (default) or L_pos."""
+        if self.uniform_knots:
+            return delta.new_zeros(())
+        if self.knot_supervision == "kl":
+            # PyTorch computes KL(target || prediction); epsilon=0 may underflow spans.
+            # With per-arm knots, batchmean sums the arms' KL terms per sample.
+            return F.kl_div(
+                delta.clamp_min(torch.finfo(delta.dtype).tiny).log(),
+                target_delta,
+                reduction="batchmean",
+            )
+        # L_pos = 1/(M-1) sum_{i=1}^{M-1} (u_i - u_i^*)^2 on interior knots.
+        M = delta.shape[-1]
+        if M < 2:
+            return delta.new_zeros(())
+        u = delta.cumsum(-1)[..., :-1]
+        u_star = target_delta.cumsum(-1)[..., :-1]
+        per_group = (u - u_star).square().mean(-1)
+        return per_group.reshape(delta.shape[0], -1).sum(-1).mean()
+
     def _context(self, cond, knots, horizon):
-        return torch.cat((cond, knots, horizon.log()), dim=-1)
+        return torch.cat((cond, knots.flatten(1), horizon.log()), dim=-1)
+
+    def _fit_control_points(self, motion, knots, query_times):
+        """Fit on the shared partition, or each arm's channels on its own partition."""
+        if knots.ndim == 2:
+            return fit_bspline_control_points_least_squares(
+                motion,
+                self.num_control_points,
+                self.degree,
+                knots=knots,
+                query_times=query_times,
+            )
+        fits = [
+            fit_bspline_control_points_least_squares(
+                block,
+                self.num_control_points,
+                self.degree,
+                knots=knots[:, arm],
+                query_times=query_times,
+            )
+            for arm, block in enumerate(motion.chunk(knots.shape[1], dim=-1))
+        ]
+        return (
+            torch.cat([cp for cp, _ in fits], dim=-1),
+            torch.stack([error for _, error in fits], -1).mean(-1),
+        )
 
     def forward_loss(self, batch):
         """Fit labels on current predicted knots; train flow, spans, timing and gripper."""
@@ -249,7 +337,7 @@ class AdaSpeVLAPolicy(nn.Module):
             return self.forward_timing_loss(batch)
         cond = self.vlm(batch["images"], instructions=batch["instructions"])
         horizon = duration_tensor(batch["horizon_duration"], cond)
-        knots, delta = self.knot_head(cond, horizon)
+        knots, delta = self._predict_knots(cond, horizon)
         # Fit each timestamped window at its actual length; never pad the fit.
         motions = batch["raw_actions"]
         times = batch["query_times"]
@@ -258,41 +346,31 @@ class AdaSpeVLAPolicy(nn.Module):
             for index, motion in enumerate(motions):
                 if motion.shape[-1] != self.motion_dim:
                     raise ValueError("raw_actions must contain physical motion only")
-                cp, error = fit_bspline_control_points_least_squares(
+                cp, error = self._fit_control_points(
                     (motion / self.motion_scale).unsqueeze(0),
-                    self.num_control_points,
-                    self.degree,
-                    knots=knots[index : index + 1].detach(),
-                    query_times=times[index].unsqueeze(0),
+                    knots[index : index + 1].detach(),
+                    times[index].unsqueeze(0),
                 )
                 targets.append(cp)
                 errors.append(error)
             target_cp, recon = torch.cat(targets), torch.cat(errors)
         context = self._context(cond, knots, horizon)
         flow_loss, _ = self.flow_policy.compute_loss(target_cp, context)
+        # Span targets are required for the knot term of the action loss.
         target_delta = batch.get("target_delta")
-        if target_delta is None:
-            # epsilon=0 is permitted; softmax may underflow to exactly zero.
-            log_delta = delta.clamp_min(torch.finfo(delta.dtype).tiny).log()
-            knot_loss = 0.01 * (delta * log_delta).sum(-1).mean()
-        else:
-            if (
-                target_delta.shape != delta.shape
-                or not torch.isfinite(target_delta).all()
-                or (target_delta <= 0).any()
-                or not torch.allclose(
-                    target_delta.sum(-1), torch.ones_like(delta[:, 0]), atol=1e-5
-                )
-            ):
-                raise ValueError(
-                    "target_delta must be a positive normalized span distribution"
-                )
-            # PyTorch computes KL(target || prediction).
-            knot_loss = F.kl_div(
-                delta.clamp_min(torch.finfo(delta.dtype).tiny).log(),
-                target_delta,
-                reduction="batchmean",
+        if (
+            target_delta is None
+            or target_delta.shape != delta.shape
+            or not torch.isfinite(target_delta).all()
+            or (target_delta <= 0).any()
+            or not torch.allclose(
+                target_delta.sum(-1), torch.ones_like(delta[..., 0]), atol=1e-5
             )
+        ):
+            raise ValueError(
+                "target_delta must be a positive normalized span distribution"
+            )
+        knot_loss = self._knot_loss(delta, target_delta)
         grip_logits = self.gripper_head(context).reshape(
             -1, self.prediction_samples, self.num_arms
         )
@@ -306,7 +384,7 @@ class AdaSpeVLAPolicy(nn.Module):
             )
         gripper_loss = F.binary_cross_entropy_with_logits(grip_logits, grip_target)
         total = (
-            flow_loss
+            self.flow_loss_coeff * flow_loss
             + self.knot_loss_coeff * knot_loss
             + self.gripper_loss_coeff * gripper_loss
         )
@@ -330,14 +408,12 @@ class AdaSpeVLAPolicy(nn.Module):
         instructions=None,
         horizon_duration=None,
         boundary_value=None,
-        boundary_derivative=None,
-        boundary_second_derivative=None,
         num_ode_steps=None,
     ):
         """Return physical base-frame velocity CPs and separate discrete grippers.
 
-        Optional boundary values concern the velocity curve (velocity, acceleration,
-        jerk), not pose. The caller chooses a trained horizon, never implicit speed scaling.
+        The optional boundary value is the last emitted physical twist (Eq. boundary);
+        it replaces control point zero only. The caller chooses a trained horizon.
         """
         self.eval()
         cond = self.vlm(images, instructions=instructions)
@@ -351,7 +427,7 @@ class AdaSpeVLAPolicy(nn.Module):
                 raise ValueError("Requested horizon is outside training support")
         if num_ode_steps is None:
             num_ode_steps = self.timing_num_ode_steps
-        knots, delta = self.knot_head(cond, horizon)
+        knots, delta = self._predict_knots(cond, horizon)
         context = self._context(cond, knots, horizon)
         cp = (
             self.flow_policy.sample(context, num_steps=num_ode_steps)
@@ -362,13 +438,8 @@ class AdaSpeVLAPolicy(nn.Module):
                 cp,
                 knots,
                 boundary_value,
-                boundary_derivative,
-                boundary_second_derivative,
                 self.degree,
-                horizon,
             )
-        elif boundary_derivative is not None or boundary_second_derivative is not None:
-            raise ValueError("Boundary derivatives require boundary_value")
         gripper = self.gripper_head(context).reshape(
             -1, self.prediction_samples, self.num_arms
         )

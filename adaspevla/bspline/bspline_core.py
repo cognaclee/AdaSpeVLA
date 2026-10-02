@@ -56,6 +56,27 @@ def eval_cox_de_boor_basis(u, knots, num_control_points, degree=3, eps=1e-8):
     return basis.squeeze(0) if unbatched else basis
 
 
+def evaluate_bspline(query_times, knots, control_points, degree=3):
+    """Batched spline values; knots (B,n) are shared, (B,G,n) give one partition per group.
+
+    With grouped knots the control-point channels split into G equal blocks (one per
+    arm, in channel order), each evaluated on its own knot vector.
+    """
+    if knots.ndim == 3:
+        groups = knots.shape[1]
+        if control_points.shape[-1] % groups:
+            raise ValueError("Control-point channels must split evenly across knot groups")
+        return torch.cat(
+            [
+                evaluate_bspline(query_times, knots[:, g], block, degree)
+                for g, block in enumerate(control_points.chunk(groups, dim=-1))
+            ],
+            dim=-1,
+        )
+    basis = eval_cox_de_boor_basis(query_times, knots, control_points.shape[1], degree)
+    return torch.bmm(basis, control_points)
+
+
 class BSplineEvaluator(nn.Module):
     def __init__(self, degree=3, num_control_points=8):
         super().__init__()
@@ -80,6 +101,15 @@ class BSplineEvaluator(nn.Module):
         and jerk, not position velocity and position acceleration.
         """
         B, K, D = control_points.shape
+        if knots is not None and knots.ndim == 3:
+            groups = knots.shape[1]
+            if D % groups:
+                raise ValueError("Control-point channels must split evenly across knot groups")
+            parts = [
+                self.forward(block, knots[:, g], query_times, num_samples, horizon_duration)
+                for g, block in enumerate(control_points.chunk(groups, dim=-1))
+            ]
+            return tuple(torch.cat(values, dim=-1) for values in zip(*parts))
         if knots is None:
             knots = compute_clamped_knot_vector(
                 K, self.degree, control_points.device, control_points.dtype
