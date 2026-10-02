@@ -55,10 +55,7 @@ export HF_HUB_OFFLINE=1
 ## Step 2: Check the installation
 
 ```bash
-# 1. Unit and integration tests (CPU, under a minute; expect "110 passed")
-python -m pytest tests -q
-
-# 2. End-to-end smoke run: synthetic data, tiny offline backbone, CPU
+# End-to-end smoke run: synthetic data, tiny offline backbone, CPU
 python -m scripts.train_robotwin --synthetic_data --test_backbone \
     --epochs 1 --timing_epochs 1 --num_ode_steps 2 --batch_size 2 \
     --device cpu --output_dir /tmp/adaspevla-smoke
