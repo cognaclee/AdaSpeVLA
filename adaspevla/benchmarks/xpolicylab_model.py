@@ -4,9 +4,11 @@ XPolicyLab asks the model for one action chunk per observation and executes the
 whole chunk before observing again. AdaSpeVLA's chunk is the executor prefix: its
 length is ``max(1, min(floor(H/dt), ceil(tau/dt)))`` control steps, where ``tau``
 comes from the timing head (``query_mode=adaptive``) or a fixed baseline interval
-(``query_mode=fixed``). Each predicted base-frame twist is integrated from the
-end-effector pose observed at query time into an absolute ``*_ee_pose`` target,
-because both benchmarks' ``ee`` action mode plans to a pose target per step.
+(``query_mode=fixed``). Each predicted base-frame offset is relative to the
+end-effector pose observed at query time and is mapped to an absolute
+``*_ee_pose`` target by Eq. delta_to_target, because both benchmarks' ``ee``
+action mode plans to a pose target per step. The gripper width is sent as a
+continuous command in [0,1] (``binary_gripper=true`` thresholds it at 0.5).
 
 One executed action corresponds to one recorded demonstration sample, so the
 control period defaults to the conversion's ``sample_dt``. RoboTwin's ``ee`` mode
@@ -21,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .pose_math import base_rotation, integrate_twist, normalized_pose, pose_error
+from .pose_math import base_rotation, delta_to_target, normalized_pose, pose_error
 from .rollout import EpisodeRecorder, PrefixPlanner, append_jsonl, load_policy
 from .xpolicylab_data import ARM_PREFIX
 
@@ -113,7 +115,7 @@ class Model(ModelTemplate):
         self.policy_dir = Path(self.cfg.get("policy_dir") or Path(__file__).resolve().parent)
         if str(self.cfg.get("action_type", "ee")).lower() not in ("ee", "endpose"):
             raise ValueError(
-                "AdaSpeVLA emits base-frame twists integrated into end-effector poses; "
+                "AdaSpeVLA emits anchor-relative offsets mapped to end-effector poses; "
                 "evaluate with action_type=ee"
             )
         device = self.cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,6 +134,8 @@ class Model(ModelTemplate):
         self.query_mode = _env_override(self.cfg, "query_mode") or "adaptive"
         interval = _env_override(self.cfg, "fixed_query_interval", float)
         self.fixed_query_interval = None if interval is None else float(interval)
+        binary = _env_override(self.cfg, "binary_gripper")
+        self.binary_gripper = str(binary).lower() in ("1", "true", "yes")
         steps = _env_override(self.cfg, "num_ode_steps", int)
         self.num_ode_steps = None if steps is None else int(steps)
         self.debug_env = os.environ.get("EVAL_ENV_TYPE", "") == "debug"
@@ -258,9 +262,8 @@ class Model(ModelTemplate):
         )
 
     def _commands(self, env, actions, info):
-        """Integrate prefix twists into absolute pose targets from the query pose."""
+        """Map prefix offsets to absolute pose targets from the query-time anchor."""
         obs = env.obs
-        env.recorder.add_prefix(actions, info)
         robot = self._robot_prefixes(obs)
         prefixes = [ARM_PREFIX[a] for a in self.arms]
         missing = [p for p in prefixes if p not in robot]
@@ -273,24 +276,30 @@ class Model(ModelTemplate):
             if p not in prefixes
         }
         arm_actions = np.asarray(actions).reshape(len(actions), len(self.arms), 7)
+        # Eq. delta_to_target: every step of the prefix shares the anchor pose.
+        poses = np.stack(
+            [
+                delta_to_target(anchors[prefix], arm_actions[:, i, :6], self.world_from_base[i])
+                for i, prefix in enumerate(prefixes)
+            ],
+            axis=1,
+        )
+        env.recorder.add_prefix(actions, info, poses)
         chunk = []
-        current = dict(anchors)
-        for step in arm_actions:
-            command, targets = {}, {}
+        for step, targets in zip(arm_actions, poses):
+            command, pending = {}, {}
             for i, prefix in enumerate(prefixes):
-                current[prefix] = integrate_twist(
-                    current[prefix], step[i, :6], self.control_dt, self.world_from_base[i]
-                )
-                targets[prefix] = current[prefix]
-                command[f"{prefix}ee_pose"] = current[prefix].astype(np.float32)
-                command[f"{prefix}ee_joint_state"] = np.array(
-                    [1.0 if step[i, 6] > 0 else 0.0], dtype=np.float32
-                )
+                width = float(np.clip(step[i, 6], 0.0, 1.0))
+                if self.binary_gripper:
+                    width = 1.0 if width >= 0.5 else 0.0
+                pending[prefix] = targets[i]
+                command[f"{prefix}ee_pose"] = targets[i].astype(np.float32)
+                command[f"{prefix}ee_joint_state"] = np.array([width], dtype=np.float32)
             for prefix, grip in holds.items():  # Unused arms hold their pose.
                 command[f"{prefix}ee_pose"] = anchors[prefix].astype(np.float32)
                 command[f"{prefix}ee_joint_state"] = grip
             chunk.append(command)
-            env.pending.append(targets)
+            env.pending.append(pending)
         return chunk
 
     def get_action(self):

@@ -1,8 +1,9 @@
 """Offline shared-vs-per-arm knot comparison on demonstration windows.
 
 The per-arm knot option is an ablation of the manuscript's single shared knot
-partition. Every quantity here is in normalized motion units (twist divided by
-the checkpoint's motion scales) and is evaluated at the demonstration timestamps:
+partition. Every quantity here is in normalized action units (anchor-relative
+offsets divided by the checkpoint's motion scales, and the gripper width mapped
+to 2w-1, seven channels per arm) evaluated at the demonstration timestamps:
 
 * ``fit_mse``: best least-squares fit of the demonstration on the knots the
   policy predicts. This isolates representation capacity of the knot layout.
@@ -12,7 +13,7 @@ the checkpoint's motion scales) and is evaluated at the demonstration timestamps
 * ``knot_span_l1``: L1 distance between the two arms' predicted span vectors
   (zero for a shared partition).
 * ``teacher_span_l1``: L1 distance between the two arms' span *targets*
-  computed from each arm's own motion. It measures how asynchronous the arms'
+  computed from each arm's own motion and gripper width. It measures how asynchronous the arms'
   complex phases are in the data, independent of any checkpoint.
 """
 
@@ -21,6 +22,7 @@ import argparse
 import torch
 
 from ..bspline.bspline_core import compute_clamped_knot_vector, evaluate_bspline
+from ..datasets.action_contract import normalize_actions
 from ..datasets.bspline_dataset import collate_windows
 from ..utils.training import window_options
 
@@ -63,7 +65,7 @@ def load_analysis_dataset(data_dir, task_name, ckpt, max_arms=2):
 
 
 def _per_arm_mse(values, target, num_arms):
-    error = (values - target).square().reshape(*values.shape[:-1], num_arms, 6)
+    error = (values - target).square().reshape(*values.shape[:-1], num_arms, 7)
     return error.mean(dim=tuple(range(error.ndim - 2)) + (error.ndim - 1,))
 
 
@@ -108,11 +110,11 @@ def analyze_knots(
             horizon_duration=batch["horizon_duration"].to(device),
             num_ode_steps=num_ode_steps,
         )
-        cp = prediction["control_points"] / scale
+        cp = normalize_actions(prediction["control_points"], scale)
         knots = prediction["knots"]
         delta = prediction["delta_simplex"]
         for i, record in enumerate(keep):
-            target = (record["raw_actions"].to(device) / scale)[None]
+            target = normalize_actions(record["raw_actions"].to(device), scale)[None]
             times = record["query_times"].to(device)[None]
             pred = evaluate_bspline(times, knots[i : i + 1], cp[i : i + 1], policy.degree)
             fit_cp, _ = policy._fit_control_points(target, knots[i : i + 1], times)

@@ -74,7 +74,7 @@ class BSplineFlowMatchingPolicy(nn.Module):
     def __init__(
         self,
         num_control_points: int = 8,
-        action_dim: int = 6,  # Motion-only normalized twist channels; grippers are separate
+        action_dim: int = 7,  # Per arm: six normalized offsets and the normalized width
         cond_dim: int = 512,
         hidden_dim: int = 384,
         num_layers: int = 6,

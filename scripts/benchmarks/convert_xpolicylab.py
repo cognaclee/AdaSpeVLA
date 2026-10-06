@@ -29,7 +29,6 @@ def main():
     )
     parser.add_argument("--sample_dt", type=float, default=None, help="Override sample period")
     parser.add_argument("--simulation_dt", type=float, default=None)
-    parser.add_argument("--gripper_threshold", type=float, default=0.5)
     parser.add_argument("--max_episodes", type=int, default=None)
     args = parser.parse_args()
     base = None
@@ -49,7 +48,6 @@ def main():
         base_wxyz=base,
         sample_dt=args.sample_dt,
         simulation_dt=args.simulation_dt,
-        gripper_threshold=args.gripper_threshold,
     )
     print(
         f"Converted {meta['episodes']} episodes: arms={meta['arms']} cameras={meta['cameras']} "

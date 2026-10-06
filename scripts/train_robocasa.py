@@ -65,7 +65,12 @@ def parse_args():
         action="store_true",
         help="Explicit small offline test backbone",
     )
-    parser.add_argument("--action_type", choices=["twist", "delta_twist"], default=None)
+    parser.add_argument(
+        "--action_type",
+        choices=["ee_pose", "twist", "delta_twist"],
+        default=None,
+        help="ee_pose (poses + widths); twist inputs are integrated into poses",
+    )
     parser.add_argument("--action_frame", choices=["base"], default=None)
     parser.add_argument(
         "--sample_dt",
@@ -93,7 +98,7 @@ def parse_args():
     )
     parser.add_argument(
         "--actions_path",
-        help="Converted physical action dataset path; does not convert joint/pose commands",
+        help="Twist action dataset path (integrated into poses); does not convert joint commands",
     )
     add_method_arguments(parser)
     return parser.parse_args()

@@ -5,14 +5,17 @@ The XPolicyLab exporter stores each row's current end-effector pose under
 (``[x,y,z,qw,qx,qy,qz]``), with commanded grippers under
 ``action/<arm>_ee_joint_states`` in [0, 1] (1 open). This module extends the
 verified right-arm conversion in ``datasets.robotwin_native`` to any arm subset
-and writes already-converted episodes that the existing loaders read unchanged:
-``images`` (T, V, H, W, 3) uint8, ``actions`` (T, 7*arms) base-frame twists plus
-binary grippers, and explicit action metadata attributes.
+and writes the pose contract that the existing loaders read unchanged:
+``images`` (T, V, H, W, 3) uint8, ``ee_poses`` (T, arms, 7) observed poses,
+``gripper`` (T, arms) continuous commanded widths, the per-arm base rotation
+``base_wxyz`` and explicit action metadata attributes. The dataset converts poses
+to anchor-relative base-frame offsets per training window (Eq. anchor_delta).
 
 Frame consistency matters more than the absolute base orientation: evaluation
-integrates predicted twists with the same per-arm ``world_from_base`` recorded in
-the conversion metadata, so a wrong but consistent base quaternion only rotates
-the learned channels. The metadata also records the timing source.
+maps predicted offsets back to pose targets with the same per-arm
+``world_from_base`` recorded in the conversion metadata, so a wrong but
+consistent base quaternion only rotates the learned channels. The metadata also
+records the timing source.
 """
 
 import json
@@ -23,8 +26,7 @@ import h5py
 import numpy as np
 
 from ..datasets.hdf5_common import read_rgb_camera
-from ..datasets.robotwin_native import DEFAULT_BASE_WXYZ
-from .pose_math import base_rotation, pose_pairs_to_twists, wxyz_to_rotation
+from ..datasets.robotwin_native import DEFAULT_BASE_WXYZ, xpolicylab_arm_trajectory
 
 CONVERSION_FILE = "adaspevla_conversion.json"
 
@@ -104,7 +106,6 @@ def convert_episode(
     base_wxyz=None,
     sample_dt=None,
     simulation_dt=None,
-    gripper_threshold=0.5,
 ):
     """Convert one XPolicyLab episode group; returns contract fields and metadata."""
     arms = list(arms)
@@ -116,8 +117,6 @@ def convert_episode(
         raise ValueError("At most two arms are supported by the 7/14-channel contract")
     if profile not in PROFILES:
         raise ValueError(f"profile must be one of {sorted(PROFILES)}")
-    if not 0 < gripper_threshold < 1:
-        raise ValueError("gripper_threshold must lie strictly between 0 and 1")
     cameras = default_cameras(arms) if cameras is None else list(cameras)
     dt, time_source = episode_sample_dt(group, profile, sample_dt, simulation_dt)
     if base_wxyz is None:
@@ -138,34 +137,12 @@ def convert_episode(
         raise ValueError("Selected cameras must have matching frame counts and resolution")
     images = np.stack(views, axis=1)
 
-    channels = []
-    for arm, base in zip(arms, base_wxyz):
-        prefix = ARM_PREFIX[arm]
-        current = _read(group, f"state/{prefix}ee_poses").astype(np.float64)
-        target = _read(group, f"action/{prefix}ee_poses").astype(np.float64)
-        if current.ndim != 2 or current.shape[1] != 7 or target.shape != current.shape:
-            raise ValueError(f"Expected matching (T,7) {arm} state/action poses")
-        if len(current) < 2 or not np.isfinite(current).all() or not np.isfinite(target).all():
-            raise ValueError(f"{arm} poses must be finite with at least two rows")
-        r0 = wxyz_to_rotation(current[:, 3:], unit_atol=1e-3)
-        r1 = wxyz_to_rotation(target[:, 3:], unit_atol=1e-3)
-        if (
-            not np.allclose(target[:-1, :3], current[1:, :3], atol=1e-5)
-            or np.max((r1[:-1] * r0[1:].inv()).magnitude()) > 1e-4
-        ):
-            raise ValueError(
-                f"{arm} state/action poses do not have the one-frame shift; refusing to infer alignment"
-            )
-        twist = pose_pairs_to_twists(current, target, dt, base_rotation(base))
-        grip = _read(group, f"action/{prefix}ee_joint_states")
-        if grip.shape != (len(current), 1) or not np.isfinite(grip).all():
-            raise ValueError(f"{arm} gripper must have shape (T,1)")
-        if (grip < -1e-6).any() or (grip > 1 + 1e-6).any():
-            raise ValueError(f"{arm} gripper values must be normalized to [0,1] (1 open)")
-        channels.append(
-            np.concatenate((twist, (grip >= gripper_threshold).astype(float)), axis=-1)
-        )
-    if len(images) != len(channels[0]):
+    poses, widths = [], []
+    for arm in arms:
+        pose, width = xpolicylab_arm_trajectory(group, ARM_PREFIX[arm], arm)
+        poses.append(pose)
+        widths.append(width)
+    if len(images) != len(poses[0]):
         raise ValueError("Image and pose sample counts differ")
     meta = dict(
         source="xpolicylab_ee_pose_v1",
@@ -175,7 +152,7 @@ def convert_episode(
         pose_order="xyz_wxyz",
         source_pose_frame="exported_ee_pose_frame",
         base_wxyz=base_wxyz.tolist(),
-        gripper_threshold=gripper_threshold,
+        gripper="continuous commanded width at the previous row, 1 open",
         gripper_open_value=1.0,
         gripper_closed_value=0.0,
         time_source=time_source,
@@ -183,7 +160,9 @@ def convert_episode(
     )
     return dict(
         images=images,
-        actions=np.concatenate(channels, axis=-1).astype(np.float32),
+        ee_poses=np.stack(poses, axis=1),
+        gripper=np.stack(widths, axis=1).astype(np.float32),
+        base_wxyz=base_wxyz,
         instruction=_instruction(group),
         sample_dt=dt,
         meta=meta,
@@ -191,6 +170,7 @@ def convert_episode(
 
 
 def write_contract_episode(path, episode, task_name):
+    """Write the pose contract: ``ee_poses`` (T,arms,7), ``gripper`` (T,arms)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "w") as f:
@@ -198,12 +178,14 @@ def write_contract_episode(path, episode, task_name):
             "images", data=episode["images"], compression="gzip", compression_opts=4,
             chunks=(1,) + episode["images"].shape[1:],
         )
-        f["actions"] = episode["actions"]
+        f["ee_poses"] = np.asarray(episode["ee_poses"], dtype=np.float64)
+        f["gripper"] = np.asarray(episode["gripper"], dtype=np.float32)
         f.attrs.update(
             task_name=task_name,
             instruction=episode["instruction"],
-            action_type="twist",
+            action_type="ee_pose",
             action_frame="base",
+            base_wxyz=np.asarray(episode["base_wxyz"], dtype=np.float64),
             gripper_open_value=float(episode["meta"]["gripper_open_value"]),
             gripper_closed_value=float(episode["meta"]["gripper_closed_value"]),
             adaspevla_conversion=json.dumps(episode["meta"], sort_keys=True),

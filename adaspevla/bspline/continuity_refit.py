@@ -5,32 +5,48 @@ import torch
 
 class BoundaryRefitter:
     @staticmethod
-    def refit_boundary_control_points(control_points, knots, x_0, degree=3):
-        """Replace control point zero with the last emitted twist.
+    def refit_boundary_control_points(
+        control_points, knots, x_0, degree=3, channels=None
+    ):
+        """Replace the selected entries of control point zero with ``x_0``.
 
-        For a clamped spline this makes the new segment's initial value equal x_0;
-        all other control points are unchanged. Control points and x_0 share units
-        (physical twists here, so this equals P_0 = D^{-1} a_last after scaling).
+        For a clamped spline this makes the new segment's initial value equal x_0
+        on those channels; every other entry is unchanged. The policy selects the
+        gripper-width channels only: motion offsets start at zero by construction
+        after re-anchoring. ``x_0`` shares the control points' units.
         """
         B, K, D = control_points.shape
         if degree < 0 or K <= degree:
             raise ValueError("Require K > degree >= 0")
-        if x_0.shape != (B, D) or not torch.isfinite(x_0).all():
-            raise ValueError("Boundary value must be a finite (B,D) tensor")
+        index = (
+            torch.arange(D, device=control_points.device)
+            if channels is None
+            else torch.as_tensor(channels, device=control_points.device).reshape(-1)
+        )
+        if (
+            index.numel() == 0
+            or index.min() < 0
+            or index.max() >= D
+            or len(index.unique()) != len(index)
+        ):
+            raise ValueError("Boundary channels must be distinct control-point channels")
+        if x_0.shape != (B, len(index)) or not torch.isfinite(x_0).all():
+            raise ValueError("Boundary value must be a finite (B, channels) tensor")
         if knots.ndim == 3:
-            # One knot partition per arm: validate each, then replace P_0 for all arms.
+            # One knot partition per arm: validate each partition.
             groups = knots.shape[1]
-            if D % groups or x_0.shape != (B, D):
-                raise ValueError("Boundary value and knot groups do not match the channels")
-            for g, (block, value) in enumerate(
-                zip(control_points.chunk(groups, -1), x_0.chunk(groups, -1))
-            ):
-                BoundaryRefitter.refit_boundary_control_points(
-                    block, knots[:, g], value, degree
-                )
-            result = control_points.clone()
-            result[:, 0] = x_0
-            return result
+            if D % groups:
+                raise ValueError("Knot groups do not split the channels")
+            for g in range(groups):
+                BoundaryRefitter._validate(knots[:, g], B, K, degree)
+        else:
+            BoundaryRefitter._validate(knots, B, K, degree)
+        result = control_points.clone()
+        result[:, 0, index] = x_0.to(result)
+        return result
+
+    @staticmethod
+    def _validate(knots, B, K, degree):
         if knots.ndim == 1:
             knots = knots.expand(B, -1)
         if (
@@ -44,6 +60,3 @@ class BoundaryRefitter:
             or not (knots[:, -degree - 1 :] == 1).all()
         ):
             raise ValueError("Boundary projection requires knots clamped to [0,1]")
-        result = control_points.clone()
-        result[:, 0] = x_0
-        return result

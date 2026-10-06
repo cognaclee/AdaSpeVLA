@@ -84,6 +84,38 @@ class LearnableKnotPlacementHead(nn.Module):
         return knots.reshape(delta.shape[0], self.num_groups, -1), delta
 
 
+def motion_variation(actions, timestamps):
+    """Normalized motion acceleration magnitude e_j per interval (Eq. density).
+
+    ``actions`` (B,T,D) are normalized anchor-relative offsets. Velocities are
+    first differences, and e_j is the norm of the second difference divided by
+    t_{j+1}-t_j for j=0..T-3. The last interval copies its neighbour
+    (e_{T-2}=e_{T-3}); a two-sample window has e_0=0. Returns (B,T-1).
+    """
+    widths = timestamps.diff(dim=-1)
+    velocity = actions.diff(dim=1) / widths.unsqueeze(-1)
+    if actions.shape[1] < 3:
+        return actions.new_zeros(actions.shape[0], actions.shape[1] - 1)
+    accel = (velocity.diff(dim=1) / widths[:, :-1].unsqueeze(-1)).norm(dim=-1)
+    return torch.cat((accel, accel[:, -1:]), dim=-1)
+
+
+def gripper_variation(gripper, timestamps):
+    """Gripper-width variation rate e^g_j = max_h |w_{j+1,h}-w_{j,h}|/dt (Eq. grip_density)."""
+    widths = timestamps.diff(dim=-1)
+    return (gripper.diff(dim=1).abs() / widths.unsqueeze(-1)).amax(-1)
+
+
+def _validate_gripper(gripper, B, T):
+    if gripper is not None and (
+        gripper.ndim != 3
+        or gripper.shape[:2] != (B, T)
+        or not torch.isfinite(gripper).all()
+        or ((gripper < 0) | (gripper > 1)).any()
+    ):
+        raise ValueError("Gripper widths must be finite (B,T,arms) values in [0,1]")
+
+
 def compute_curvature_density_target(
     actions,
     num_intervals=5,
@@ -91,9 +123,15 @@ def compute_curvature_density_target(
     min_interval_eps=0.01,
     density_gain=10.0,
     criticality=None,
+    gripper=None,
+    gripper_gain=10.0,
+    gripper_ref=1.0,
 ):
-    """Inverse-CDF spans from normalized motion velocities (grippers excluded).
+    """Inverse-CDF spans from normalized motion acceleration and gripper variation.
 
+    ``actions`` holds the normalized motion channels only; ``gripper`` holds the
+    widths in [0,1] (B,T,arms) and contributes the separate beta_g term, so a
+    fast grasp is neither diluted by nor dominates the six motion channels.
     Acceleration magnitude is a representation-complexity heuristic, not measured
     feedback need. Timestamps are physical seconds; optional criticality is [0,1].
     The density is constant on each observed time interval, so short and irregular
@@ -103,6 +141,8 @@ def compute_curvature_density_target(
         raise ValueError("Need (B,T,D), T >= 2 and at least one knot interval")
     if not 0 <= min_interval_eps < 1 / num_intervals:
         raise ValueError("Invalid minimum knot span")
+    if not gripper_ref > 0 or not gripper_gain >= 0:
+        raise ValueError("Gripper reference rate must be positive and its gain nonnegative")
     B, T, _ = actions.shape
     if timestamps is None:
         raise ValueError(
@@ -120,8 +160,14 @@ def compute_curvature_density_target(
         )
     if not torch.isfinite(actions).all():
         raise ValueError("Motion values must be finite")
-    accel = (actions.diff(dim=1) / widths.unsqueeze(-1)).norm(dim=-1)
-    density = 1 + density_gain * torch.tanh(accel)
+    # e_ref = 1 s^-2 is implicit in tanh(e_j), as stated in the manuscript.
+    density = 1 + density_gain * torch.tanh(motion_variation(actions, timestamps))
+    if gripper is not None:
+        gripper = gripper.to(actions)
+        _validate_gripper(gripper, B, T)
+        density = density + gripper_gain * torch.tanh(
+            gripper_variation(gripper, timestamps) / gripper_ref
+        )
     if criticality is not None:
         if (
             criticality.shape != (B, T)
@@ -165,10 +211,13 @@ def query_interval_target(
     motion=None,
     e_crit=None,
     anticipation_margin=0.0,
+    gripper_threshold=0.5,
 ):
     """Event-based timing teacher; knot span lengths do not determine the label.
 
-    Measured open-loop query-interval labels should override this teacher in data.
+    Events (Eq. timing_events) are a normalized motion acceleration
+    e_{j-1} >= e_crit, any arm's width crossing ``gripper_threshold``, or
+    criticality >= 0.5. Measured query-interval labels override this teacher.
     """
     if motion is None or timestamps is None:
         raise ValueError(
@@ -206,27 +255,24 @@ def query_interval_target(
         or ((criticality < 0) | (criticality > 1)).any()
     ):
         raise ValueError("Criticality must be finite (B,T) values in [0,1]")
-    if gripper is not None and (
-        gripper.ndim != 3
-        or gripper.shape[:2] != (B, T)
-        or not ((gripper == 0) | (gripper == 1)).all()
-    ):
-        raise ValueError("Demonstrated gripper states must be binary (B,T,arms)")
+    if gripper is not None:
+        gripper = gripper.to(motion)
+    _validate_gripper(gripper, B, T)
+    if not 0 < gripper_threshold < 1:
+        raise ValueError("gripper_threshold must lie strictly between 0 and 1")
     lower = torch.minimum(horizon, torch.full_like(horizon, min_interval))
     upper = torch.minimum(horizon, torch.full_like(horizon, max_interval))
     if e_crit is None or not 0 < e_crit < float("inf"):
         raise ValueError("A positive training-calibrated e_crit is required")
     if not 0 <= anticipation_margin < float("inf"):
         raise ValueError("Anticipation margin must be finite and nonnegative")
-    variation_rate = (motion.diff(dim=1) / timestamps.diff(dim=-1).unsqueeze(-1)).norm(
-        dim=-1
-    )
-    # Only j >= 1 is eligible, as specified by the manuscript event set.
-    event = variation_rate >= e_crit
+    # Index j-1 of e marks event j; only j >= 1 is eligible (Eq. timing_events).
+    event = motion_variation(motion, timestamps.to(motion)) >= e_crit
     if criticality is not None:
         event |= criticality[:, 1:] >= 0.5
     if gripper is not None:
-        event |= (gripper[:, 1:] != gripper[:, :-1]).any(-1)
+        state = gripper >= gripper_threshold
+        event |= (state[:, 1:] != state[:, :-1]).any(-1)
     relative_times = timestamps[:, 1:] - timestamps[:, :1]
     risk_time = torch.where(
         event, relative_times, torch.full_like(relative_times, float("inf"))

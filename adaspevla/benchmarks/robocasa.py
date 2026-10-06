@@ -4,10 +4,12 @@ Data. RoboCasa365 ships LeRobot v2.1 datasets (lerobot==0.3.3). Its 12-D action 
 a controller-normalized OSC *setpoint offset*, not a physical motion, so it is not
 used as the motion target. Instead the achieved end-effector pose relative to the
 robot base (``observation.state[7:10]`` position, ``[10:14]`` xyzw quaternion, see
-robocasa/models/assets/groot_dataset_assets/PandaOmron_modality.json) is
-differenced over the recorded ``timestamp`` column into base-frame twists, as in
-the RoboTwin pose conversion. Grippers come from the commanded
-``gripper_close`` channel (robosuite: -1 open, +1 closed).
+robocasa/models/assets/groot_dataset_assets/PandaOmron_modality.json) is stored
+with the recorded ``timestamp`` column as the pose contract; training windows
+convert it to anchor-relative offsets (Eq. anchor_delta). This dataset logs only
+a binary gripper command (``gripper_close``, robosuite: -1 open, +1 closed), so
+the width is mapped to {0, 1}; the width at t_j is the command issued at row
+j-1, matching the pose that command reaches.
 
 The policy does not move the mobile base, so episodes whose ``base_motion`` or
 ``control_mode`` channels are active are rejected by default.
@@ -15,9 +17,10 @@ The policy does not move the mobile base, so episodes whose ``base_motion`` or
 Control. In arm mode robosuite's OSC sets ``goal = achieved + scale * clip(a)``
 in the base frame (robosuite/controllers/parts/arm/osc.py, ``goal_update_mode``
 "achieved"), with ``goal_ori = R(scale * a_rot) @ achieved_ori``. Commanding
-``a = (target - current) / scale`` therefore tracks the integrated spline pose
-targets with fresh state feedback at every 20 Hz control step, while the policy
-itself is queried only at the adaptive prefix boundaries.
+``a = (target - current) / scale`` therefore tracks the spline pose targets
+(Eq. delta_to_target from the pose observed at query time) with fresh state
+feedback at every 20 Hz control step, while the policy itself is queried only at
+the adaptive prefix boundaries. The binary gripper receives 1[w >= 0.5].
 """
 
 import json
@@ -26,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .pose_math import integrate_twist, pose_error, pose_pairs_to_twists, wxyz_to_rotation
+from .pose_math import delta_to_target, pose_error, wxyz_to_rotation
 from .rollout import EpisodeRecorder, PrefixPlanner
 from scipy.spatial.transform import Rotation
 
@@ -145,10 +148,10 @@ def convert_episode(dataset, episode_index, cameras=None, base_motion="error"):
         (state[:, STATE_EEF_POS], _xyzw_to_wxyz(state[:, STATE_EEF_QUAT_XYZW])), axis=-1
     )
     pose[:, 3:] /= np.linalg.norm(pose[:, 3:], axis=-1, keepdims=True)
-    # Sample t pairs observation t with the achieved motion until observation t+1.
-    twist = pose_pairs_to_twists(pose[:-1], pose[1:], np.diff(times), IDENTITY)
-    grip_cmd = action[:-1, ACTION_GRIPPER_CLOSE]
+    # Binary log: width 1 open / 0 closed; the width at t_j is row j-1's command.
+    grip_cmd = action[:, ACTION_GRIPPER_CLOSE]
     gripper_open = (grip_cmd <= 0).astype(np.float64)
+    gripper_open = np.concatenate((gripper_open[:1], gripper_open[:-1]))
     views = [dataset.video(episode_index, c) for c in cameras]
     for camera, view in zip(cameras, views):
         if len(view) != len(times):
@@ -157,7 +160,7 @@ def convert_episode(dataset, episode_index, cameras=None, base_motion="error"):
             )
     if any(v.shape[1:] != views[0].shape[1:] for v in views):
         raise ValueError("Selected cameras must share one resolution")
-    images = np.stack([v[:-1] for v in views], axis=1)
+    images = np.stack(views, axis=1)
     task_index = int(np.asarray(df["task_index"])[0]) if "task_index" in df.columns else None
     instruction = dataset.tasks.get(task_index, "") if task_index is not None else ""
     if not instruction.strip():
@@ -172,7 +175,7 @@ def convert_episode(dataset, episode_index, cameras=None, base_motion="error"):
         base_wxyz=[[1.0, 0.0, 0.0, 0.0]],
         time_source="lerobot_timestamps",
         sample_dt=float(np.median(dt)),
-        gripper_source="action.gripper_close (<=0 open)",
+        gripper_source="action.gripper_close (<=0 open), previous row, binary log",
         gripper_open_value=1.0,
         gripper_closed_value=0.0,
         osc_position_scale=OSC_POSITION_SCALE,
@@ -182,8 +185,10 @@ def convert_episode(dataset, episode_index, cameras=None, base_motion="error"):
     )
     return dict(
         images=images,
-        actions=np.concatenate((twist, gripper_open[:, None]), axis=-1).astype(np.float32),
-        timestamps=(times[:-1] - times[0]).astype(np.float64),
+        ee_poses=pose[:, None],
+        gripper=gripper_open[:, None].astype(np.float32),
+        base_wxyz=np.array([[1.0, 0.0, 0.0, 0.0]]),
+        timestamps=(times - times[0]).astype(np.float64),
         instruction=instruction,
         meta=meta,
         base_moved=bool(moved),
@@ -278,17 +283,17 @@ class RoboCasaClosedLoop:
             actions, info = self.planner.plan(
                 {"images": self._images(obs), "instructions": [instruction]}
             )
-            self.recorder.add_prefix(actions, info)
-            target = observed_pose(obs)
-            for action in actions:
-                target = integrate_twist(target, action[:6], self.control_dt, IDENTITY)
+            # Eq. delta_to_target from the pose observed with this query.
+            targets = delta_to_target(observed_pose(obs), actions[:, :6], IDENTITY)
+            self.recorder.add_prefix(actions, info, targets[:, None])
+            for action, target in zip(actions, targets):
                 position, rotation = osc_delta_command(
                     target, observed_pose(obs), self.position_scale, self.rotation_scale
                 )
                 obs, _, done, truncated, step_info = env.step({
                     "action.end_effector_position": position,
                     "action.end_effector_rotation": rotation,
-                    "action.gripper_close": np.array([0.0 if action[6] > 0 else 1.0]),
+                    "action.gripper_close": np.array([0.0 if action[6] >= 0.5 else 1.0]),
                     "action.base_motion": np.zeros(4),
                     "action.control_mode": np.array([0.0]),
                 })

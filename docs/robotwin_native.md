@@ -2,9 +2,10 @@
 
 Use this guide for the official RoboTwin state/action-paired HDF5 export (for
 example `.../DynamicDAPolicy/data/robotwin/source_domain`). The adapter reads the
-head and right-wrist cameras and the right-arm poses, converts them to six
-base-frame motion channels plus a binary gripper while loading, and trains on
-that. The left arm is not used as an action target.
+head and right-wrist cameras, the right-arm poses and the continuous commanded
+gripper width while loading. Each training window converts the poses to six
+base-frame offsets from the pose at its first sample, and trains on those plus
+the width. The left arm is not used as an action target.
 
 For RoboTwin 2.0 data downloaded through XPolicyLab, or for two-arm training and
 simulator evaluation, use [benchmarks.md, Part A](benchmarks.md#part-a-robotwin-20-through-the-xpolicylab-adapter)
@@ -36,8 +37,8 @@ The episode must contain these datasets:
 |---|---|
 | `vision/cam_head/colors` | Head-camera images |
 | `vision/cam_right_wrist/colors` | Right-wrist images |
-| `state/right_ee_poses`, `action/right_ee_poses` | Current and next world poses, converted to base-frame twists |
-| `action/right_ee_joint_states` | Gripper target, open when the value is at least `0.5` |
+| `state/right_ee_poses`, `action/right_ee_poses` | Current and next world poses; the current poses become anchor-relative offsets |
+| `action/right_ee_joint_states` | Commanded gripper width in [0,1] (1 open), kept continuous |
 | `instructions` | First nonempty instruction from the JSON list |
 | `additional_info/frequency` | Collector save stride, used to estimate the sample period |
 
@@ -62,7 +63,6 @@ Options for this mode:
 | Option | Default | When to change it |
 |---|---|---|
 | `--robotwin_base_wxyz qw qx qy qz` | `0.707 0 0 0.707` | Another embodiment than the official Aloha-AgileX |
-| `--robotwin_gripper_threshold` | `0.5` | Another binary threshold for the gripper |
 | `--robotwin_simulation_dt` | `1/250` | The collector used another simulation timestep |
 | `--sample_dt` | `frequency × simulation_dt` | You know the true sample period in seconds |
 | `--camera_paths A B` | head, right wrist | Other camera datasets, in view order |
@@ -103,20 +103,21 @@ Inspected RoboTwin commit `ea8b21121ebb3cd201ff5b3fe361944ac94eda3f`:
 
 ### Conversion
 
-For each row, `state/right_ee_poses` is the current pose `(p0,R0)` and
-`action/right_ee_poses` the next pose `(p1,R1)`. The adapter checks the official
+For each row, `state/right_ee_poses` is the current pose `(p_j,R_j)` and
+`action/right_ee_poses` the next pose. The adapter checks the official
 one-frame shift between consecutive rows, comparing orientations as rotations so
-quaternion sign flips are harmless. With robot-root rotation `Rbase`:
+quaternion sign flips are harmless, and keeps the observed poses. For a training
+window anchored at row `k`, with robot-root rotation `Rbase`:
 
 ```
-v_base     = Rbase.T @ (p1-p0) / dt
-omega_base = Rbase.T @ Log(R1 @ R0.T) / dt
+a_pos = Rbase.T @ (p_j - p_k)
+a_rot = Rbase.T @ Log(R_j @ R_k.T)
 ```
 
-`Log` returns the axis-angle rotation vector. These are interval-average
-velocities reconstructed from demonstrated poses, not the original controller
-commands. The gripper target is `action/right_ee_joint_states >= 0.5`, an explicit
-adaptation to the binary gripper head.
+`Log` returns the axis-angle rotation vector, so `a(t_k) = 0`. The width at row
+`j` is `action/right_ee_joint_states` of row `j-1` (row 0 for the first sample):
+the command that is meant to hold once the pose of row `j` is reached. It stays
+continuous; thresholding happens only for binary grippers at execution.
 
 ### Timing limitation
 
@@ -129,4 +130,5 @@ and records its time source in the checkpoint calibration. `--sample_dt` and
 timing; exact-time experiments need a timestamp-preserving export.
 
 Calibration records the source profile, selected arm, base rotation, gripper
-threshold and timing conversion alongside the normalization statistics.
+convention (continuous width) and timing conversion alongside the
+normalization statistics.

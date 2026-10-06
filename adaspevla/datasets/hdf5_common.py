@@ -18,7 +18,9 @@ def synthetic_episodes(task_name, action_dim=7, chunk_horizon=16):
         actions = np.zeros((T, action_dim), dtype=np.float32)
         for arm in range(action_dim // 7):
             actions[:, 7 * arm] = 0.03 * np.sin(times * 8)
-            actions[:, 7 * arm + 6] = np.where(times < times[T // 2], -1.0, 1.0)
+            actions[:, 7 * arm + 5] = 0.2 * np.cos(times * 6)
+            # Continuous width: a smooth opening transition, not a binary step.
+            actions[:, 7 * arm + 6] = np.tanh((times - times[T // 2]) / 0.03)
         episodes.append(
             dict(
                 images=rng.integers(0, 256, (T, 2, 32, 32, 3), dtype=np.uint8),
@@ -127,7 +129,6 @@ def load_hdf5_dataset(
     actions_path=None,
     robotwin_native_right=False,
     robotwin_base_wxyz=None,
-    robotwin_gripper_threshold=0.5,
     robotwin_simulation_dt=1 / 250,
     **overrides,
 ):
@@ -230,7 +231,7 @@ def load_hdf5_dataset(
                         from .robotwin_native import native_right_episode
 
                         for key, expected in {
-                            "action_type": "twist",
+                            "action_type": "ee_pose",
                             "action_frame": "base",
                             "gripper_open_value": 1.0,
                             "gripper_closed_value": 0.0,
@@ -247,7 +248,6 @@ def load_hdf5_dataset(
                             images,
                             sample_dt=overrides.get("sample_dt"),
                             base_wxyz=robotwin_base_wxyz,
-                            gripper_threshold=robotwin_gripper_threshold,
                             simulation_dt=robotwin_simulation_dt,
                         )
                         for key in (
@@ -266,19 +266,33 @@ def load_hdf5_dataset(
                         continue
                     if (
                         actions_path is None
+                        and "ee_poses" not in group
                         and "action/left_ee_poses" in group
                         and "action/right_ee_poses" in group
                     ):
                         raise ValueError(
-                            f"{path}: this export contains per-arm pose/joint targets, not physical twist actions. "
-                            "Camera decoding is supported, but pose-to-twist conversion requires the "
+                            f"{path}: this is a raw XPolicyLab export with per-arm state/action poses. "
+                            "Camera decoding is supported, but building the pose contract requires the "
                             "quaternion order, reference frame, action/state time alignment and gripper "
-                            "coding. Do not pass an ee_poses dataset as --actions_path. "
-                            "Provide a converted twist dataset and select it with --actions_path."
+                            "coding. Convert it with scripts.benchmarks.convert_xpolicylab "
+                            "(or --robotwin_native_right for the right arm)."
                         )
-                    actions = _array(
-                        group, [actions_path] if actions_path else ["actions", "action"]
-                    )
+                    if actions_path is None and "ee_poses" in group:
+                        # Converted pose contract: (T,arms,7) poses and raw widths.
+                        ep_actions = dict(
+                            ee_poses=_array(group, ["ee_poses"]),
+                            gripper=_array(group, ["gripper"]),
+                        )
+                        base = group.attrs.get("base_wxyz", root.attrs.get("base_wxyz"))
+                        if base is not None:
+                            ep_actions["base_wxyz"] = np.asarray(base, dtype=np.float64)
+                    else:
+                        ep_actions = dict(
+                            actions=_array(
+                                group,
+                                [actions_path] if actions_path else ["actions", "action"],
+                            )
+                        )
                     instruction = _decode(
                         group.attrs.get(
                             "instruction",
@@ -289,7 +303,7 @@ def load_hdf5_dataset(
                         if key in group:
                             instruction = _decode(group[key][()])
                             break
-                    ep = dict(images=images, actions=actions, instruction=instruction)
+                    ep = dict(images=images, instruction=instruction, **ep_actions)
                     for key in (
                         "action_type",
                         "action_frame",
@@ -331,7 +345,6 @@ def load_hdf5_dataset(
                         ep["sample_dt"] = period
                     for key in (
                         "timestamps",
-                        "action_durations",
                         "criticality",
                         "query_intervals",
                         "terminated",

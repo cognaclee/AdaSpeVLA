@@ -201,6 +201,7 @@ Evaluation settings (environment variable or `deploy.yml` key):
 | `ADASPEVLA_NUM_ODE_STEPS` | `num_ode_steps` | from checkpoint | Flow integration steps |
 | `ADASPEVLA_METRICS_DIR` | `metrics_dir` | `${POLICY_DIR}/eval_metrics` | JSONL output |
 | `ADASPEVLA_CONTROL_DT` | `control_dt` | converted `sample_dt` | One action per recorded sample |
+| `ADASPEVLA_BINARY_GRIPPER` | `binary_gripper` | `false` | Send `1[w >= 0.5]` instead of the continuous width |
 | `EXTRA_INFO` | | none | RoboTwin options, e.g. `task_config=demo_clean,test_num=100` |
 | | `eval_batch` | `false` | Keep `false` for timing studies |
 
@@ -240,8 +241,8 @@ python -m scripts.benchmarks.train_converted \
 Converter options: `--profile robotwin|robodojo`, `--arms` (`left`, `right`,
 `single`, in channel order; default `right`), `--cameras` (default: head plus the
 wrist camera of each arm), `--base_wxyz` (4 values, or 4 per arm),
-`--sample_dt`, `--simulation_dt`, `--gripper_threshold` (0.5),
-`--max_episodes`.
+`--sample_dt`, `--simulation_dt`, `--max_episodes`. The converter stores the
+observed poses and the continuous commanded widths; it never thresholds them.
 
 ---
 
@@ -498,8 +499,9 @@ python -m scripts.benchmarks.summarize_metrics ./eval_metrics/robocasa --csv rob
 
 Records hold success, executed steps, policy queries, queries per step, nominal
 query rate, per-query inference time, the predicted-interval distribution,
-prefix-length histogram, commanded-pose tracking error, linear and angular jerk,
-the boundary value jump and `knot_mode`. Rows are grouped by mode (adaptive or
+prefix-length histogram, commanded-pose tracking error, linear and angular jerk of
+the commanded pose targets, the velocity jump of those targets at prefix
+boundaries, the mean commanded gripper width and `knot_mode`. Rows are grouped by mode (adaptive or
 each fixed interval) and by `knot_mode`.
 
 ---
@@ -516,7 +518,7 @@ between policy calls.
 
 | Benchmark | Use | Why |
 |---|---|---|
-| **RoboTwin 2.0** (SAPIEN, Aloha-AgileX, 50 bimanual tasks) | **Main** | Free-space transport mixed with short contact phases. The `ee` mode takes absolute end-effector pose targets, which our twists integrate into. Clean and randomized settings and a public leaderboard. |
+| **RoboTwin 2.0** (SAPIEN, Aloha-AgileX, 50 bimanual tasks) | **Main** | Free-space transport mixed with short contact phases. The `ee` mode takes absolute end-effector pose targets, which our anchor-relative offsets map to. Clean and randomized settings and a public leaderboard. |
 | **RoboCasa365** (MuJoCo/robosuite, PandaOmron, 20 Hz OSC) | **Second** | Different simulator, embodiment and controller. Real per-frame timestamps, so timing labels are exact. Stationary-base tasks only. |
 | **RoboDojo** (Isaac Sim, 42 tasks) | Optional | Shares XPolicyLab with RoboTwin. Its end-effector frame is unverified, so the base quaternion must be given explicitly. |
 | ActiveArena-Bench | Not used | Targets active perception with 18-D joint actions; AdaSpeVLA has no camera control. |
@@ -540,30 +542,34 @@ scores, so they show little about feedback timing.
 
 ### Caveats
 
-* **Actions.** Each predicted twist is integrated from the end-effector pose
-  observed at query time into an absolute `*_ee_pose` target, using the per-arm
-  base rotation recorded at conversion (Aloha default `[0.707, 0, 0, 0.707]`).
-  Grippers map +1 to 1.0 (open) and −1 to 0.0 (closed). Arms the checkpoint
-  does not control hold their pose.
+* **Actions.** Each predicted offset is relative to the end-effector pose
+  observed at query time and becomes an absolute `*_ee_pose` target by
+  Eq. delta_to_target (`p = p_k + R_b a_pos`, `R = Exp(R_b a_rot) R_k`), using
+  the per-arm base rotation recorded at conversion (Aloha default
+  `[0.707, 0, 0, 0.707]`). The gripper width is clamped to [0,1] and sent as a
+  continuous `*_ee_joint_state` (1 open). Arms the checkpoint does not control
+  hold their pose.
 * **Timing is nominal on RoboTwin.** One executed action equals one recorded
   sample (`sample_dt = save_freq × 1/250 s = 0.06 s`). The `ee` mode plans its
   own path to each target, so simulated time per action varies. Report queries
   per executed step alongside the nominal query rate.
 * **Batched evaluation** (`eval_batch: true`) forces every environment to the
   shortest prefix in the batch. Use unbatched runs for timing results.
-* **RoboCasa control.** Training targets are achieved motion: twists come from
-  the recorded base-to-end-effector pose differenced over the `timestamp` column,
-  and grippers from `gripper_close`. The evaluator commands
-  `a = (target − current)/scale`, clipped, at every 20 Hz step, using fresh
-  state; the policy runs only at prefix boundaries.
+* **RoboCasa control.** Training targets are achieved motion: offsets of the
+  recorded base-to-end-effector pose from the pose at each window start, with
+  the `timestamp` column; the binary `gripper_close` log maps to widths {0, 1}.
+  The evaluator maps offsets to pose targets from the pose observed at query
+  time and commands `a = (target − current)/scale`, clipped, at every 20 Hz
+  step, using fresh state; the gripper receives `1[w >= 0.5]`. The policy runs
+  only at prefix boundaries.
 * **Fixed vs adaptive.** Both modes run the same checkpoint on the same seeds.
   Fixed mode only replaces the predicted interval with a constant, which is the
   paper's fixed-versus-supervised ablation.
 
 ### Validation status
 
-Run offline here: the full test suite (110 tests, including the benchmark
-tests in `tests/benchmarks/`). They cover pose round trips, the converters, timing
+Run offline here: the full test suite (119 tests, including the benchmark
+tests in `tests/benchmarks/`). They cover anchor-offset round trips, the converters, timing
 profiles, the executor step rule, the XPolicyLab model, the convert-then-train
 CLIs, the RoboCasa closed loop against a stub environment, and the per-arm knot
 ablation. The adapter also ran end to end through XPolicyLab's policy server

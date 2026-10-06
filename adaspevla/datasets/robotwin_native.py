@@ -1,4 +1,4 @@
-"""Right-arm adapter for RoboTwin's native XPolicyLab v1.0 export.
+"""Right-arm adapter for RoboTwin's native XPolicyLab v1.0 export (pose contract).
 
 Conventions verified against RoboTwin ea8b21121ebb3cd201ff5b3fe361944ac94eda3f:
   envs/utils/pkl2hdf5.py, envs/robot/robot.py, envs/_base_task.py.
@@ -13,36 +13,32 @@ from scipy.spatial.transform import Rotation
 DEFAULT_BASE_WXYZ = [0.707, 0.0, 0.0, 0.707]
 
 
-def native_right_episode(
-    group,
-    images,
-    sample_dt=None,
-    base_wxyz=None,
-    gripper_threshold=0.5,
-    simulation_dt=1 / 250,
-):
-    """Convert consecutive observed poses to average physical base-frame twists.
+def xpolicylab_arm_trajectory(group, prefix, label="right"):
+    """Observed poses and commanded widths of one arm at the row timestamps.
 
-    This is trajectory finite differencing, not reconstruction of the simulator's
-    original joint-controller command. Gripper binarization is explicit.
+    ``state/<arm>_ee_poses`` row j is the pose at t_j and ``action/<arm>_ee_poses``
+    row j its successor (verified one-frame shift). The width at t_j is the width
+    commanded at row j-1 (row 0 for t_0), so a controller step that targets the
+    pose at t_{j+1} also receives the width demonstrated for that step. Widths
+    stay continuous in [0,1] (1 open); they are never thresholded here.
     """
 
     def read(path):
         if path not in group:
-            raise ValueError(f"Native RoboTwin export requires {path}")
+            raise ValueError(f"XPolicyLab export requires {path}")
         return np.asarray(group[path])
 
-    current = read("state/right_ee_poses").astype(np.float64)
-    target = read("action/right_ee_poses").astype(np.float64)
+    current = read(f"state/{prefix}ee_poses").astype(np.float64)
+    target = read(f"action/{prefix}ee_poses").astype(np.float64)
     if (
         current.ndim != 2
         or current.shape[1] != 7
         or target.shape != current.shape
         or len(current) < 2
     ):
-        raise ValueError("Expected matching (T,7) right-arm state/action poses")
+        raise ValueError(f"Expected matching (T,7) {label} state/action poses")
     if not np.isfinite(current).all() or not np.isfinite(target).all():
-        raise ValueError("Right-arm poses must be finite")
+        raise ValueError(f"{label} poses must be finite")
 
     def rotations(pose):
         q = pose[:, 3:]
@@ -56,11 +52,41 @@ def native_right_episode(
         or np.max((r1[:-1] * r0[1:].inv()).magnitude()) > 1e-4
     ):
         raise ValueError(
-            "State/action poses do not have the official one-frame shift; refusing to infer alignment"
+            f"{label} state/action poses do not have the official one-frame shift; refusing to infer alignment"
         )
-    if len(images) != len(current):
+    grip = read(f"action/{prefix}ee_joint_states")
+    if (
+        grip.shape != (len(current), 1)
+        or not np.isfinite(grip).all()
+        or (grip < -1e-6).any()
+        or (grip > 1 + 1e-6).any()
+    ):
+        raise ValueError(
+            f"{label} gripper must have shape (T,1) and values in [0,1] (1 open)"
+        )
+    width = np.concatenate((grip[:1, 0], grip[:-1, 0]))
+    poses = current.copy()
+    poses[:, 3:] /= np.linalg.norm(poses[:, 3:], axis=-1, keepdims=True)
+    return poses, np.clip(width, 0.0, 1.0)
+
+
+def native_right_episode(
+    group,
+    images,
+    sample_dt=None,
+    base_wxyz=None,
+    simulation_dt=1 / 250,
+):
+    """Right-arm observed poses and continuous commanded widths (pose contract).
+
+    The dataset re-anchors these poses at each window start (Eq. anchor_delta).
+    """
+    poses, width = xpolicylab_arm_trajectory(group, "right_")
+    if len(images) != len(poses):
         raise ValueError("Image and right-arm pose lengths differ")
-    frequency = read("additional_info/frequency")
+    if "additional_info/frequency" not in group:
+        raise ValueError("Native RoboTwin export requires additional_info/frequency")
+    frequency = np.asarray(group["additional_info/frequency"])
     if frequency.ndim != 0 or not np.isfinite(frequency) or frequency <= 0:
         raise ValueError("additional_info/frequency must be a positive scalar")
     if sample_dt is None:
@@ -85,21 +111,6 @@ def native_right_episode(
     )
     if base.shape != (4,) or not np.isfinite(base).all() or np.linalg.norm(base) < 1e-8:
         raise ValueError("Base orientation must be a finite nonzero wxyz quaternion")
-    world_to_base = Rotation.from_quat(base[[1, 2, 3, 0]]).inv()
-    velocity = world_to_base.apply((target[:, :3] - current[:, :3]) / sample_dt)
-    angular = world_to_base.apply((r1 * r0.inv()).as_rotvec() / sample_dt)
-    grip = read("action/right_ee_joint_states")
-    if (
-        grip.shape != (len(current), 1)
-        or not np.isfinite(grip).all()
-        or (grip < -1e-6).any()
-        or (grip > 1 + 1e-6).any()
-    ):
-        raise ValueError(
-            "Native right gripper must have shape (T,1) and values in [0,1]"
-        )
-    if not 0 < gripper_threshold < 1:
-        raise ValueError("gripper_threshold must lie strictly between 0 and 1")
     text = group["instructions"][()]
     if isinstance(text, bytes):
         text = text.decode("utf8")
@@ -118,7 +129,7 @@ def native_right_episode(
         pose_order="xyz_wxyz",
         source_pose_frame="world",
         base_wxyz=base.tolist(),
-        gripper_threshold=gripper_threshold,
+        gripper="continuous commanded width in [0,1], 1 open",
         time_source=time_source,
         sample_dt=sample_dt,
         exported_frequency=float(frequency),
@@ -127,11 +138,11 @@ def native_right_episode(
     )
     return dict(
         images=images,
-        actions=np.concatenate(
-            (velocity, angular, (grip >= gripper_threshold).astype(float)), axis=-1
-        ).astype(np.float32),
+        ee_poses=poses[:, None],
+        gripper=width[:, None],
+        base_wxyz=base,
         instruction=instructions,
-        action_type="twist",
+        action_type="ee_pose",
         action_frame="base",
         sample_dt=sample_dt,
         gripper_open_value=1.0,

@@ -1,10 +1,11 @@
-"""Pose differencing and twist integration in an explicit robot base frame.
+"""Anchor-relative pose offsets in an explicit robot base frame.
 
 Poses are ``[x, y, z, qw, qx, qy, qz]`` (XPolicyLab/RoboTwin order) unless a
-function says otherwise. Angular velocity is a spatial axis-angle rate, matching
-``robotwin_native``: ``omega = Log(R1 @ R0.T) / dt`` expressed in the base frame.
-Integration is the exact inverse of that differencing, so converting demonstrated
-poses to twists and integrating them back reproduces the demonstrated poses.
+function says otherwise. The motion action is the offset of a pose from the
+anchor pose observed at query time (manuscript Eq. anchor_delta), expressed in
+the arm base frame with an axis-angle rotation vector. ``delta_to_target`` is
+its exact inverse (Eq. delta_to_target), so converting demonstrated poses to
+offsets and back reproduces the demonstrated poses.
 """
 
 import numpy as np
@@ -35,41 +36,48 @@ def base_rotation(base_wxyz):
     return wxyz_to_rotation(base)
 
 
-def pose_pairs_to_twists(current, target, sample_dt, world_from_base):
-    """Average base-frame twists between paired poses (T,7) -> (T,6).
+def anchor_deltas(poses, anchor, world_from_base):
+    """Anchor-relative base-frame offsets (Eq. anchor_delta), (T,7) -> (T,6).
 
-    ``current`` and ``target`` are expressed in the same frame (world for
-    RoboTwin). ``world_from_base`` rotates base-frame vectors into that frame;
-    pass the identity when poses are already in the base frame.
+    ``poses`` and ``anchor`` are ``[x,y,z,qw,qx,qy,qz]`` in the logging frame;
+    ``world_from_base`` (R_b) rotates base-frame vectors into that frame. The
+    first three channels are ``R_b^T (p - p_anchor)`` in metres, the last three
+    the rotation vector ``R_b^T Log(R R_anchor^T)`` in radians (a spatial,
+    left-composed relative rotation, not Euler angles).
     """
-    current = np.asarray(current, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    if current.ndim != 2 or current.shape[1] != 7 or target.shape != current.shape:
-        raise ValueError("Expected matching (T,7) current/target poses")
-    dt = np.asarray(sample_dt, dtype=np.float64)
-    if not np.isfinite(dt).all() or (dt <= 0).any():
-        raise ValueError("sample_dt must be positive finite seconds")
-    dt = np.broadcast_to(dt, (len(current),))[:, None]
-    r0 = wxyz_to_rotation(current[:, 3:], unit_atol=1e-3)
-    r1 = wxyz_to_rotation(target[:, 3:], unit_atol=1e-3)
+    poses = np.asarray(poses, dtype=np.float64)
+    anchor = np.asarray(anchor, dtype=np.float64)
+    if poses.ndim != 2 or poses.shape[1] != 7 or anchor.shape != (7,):
+        raise ValueError("Expected (T,7) poses and a 7-D anchor pose")
+    if not np.isfinite(poses).all() or not np.isfinite(anchor).all():
+        raise ValueError("Poses must be finite")
+    rotations = wxyz_to_rotation(poses[:, 3:], unit_atol=1e-3)
+    reference = wxyz_to_rotation(anchor[3:], unit_atol=1e-3)
     to_base = world_from_base.inv()
-    velocity = to_base.apply((target[:, :3] - current[:, :3]) / dt)
-    angular = to_base.apply((r1 * r0.inv()).as_rotvec() / dt)
-    return np.concatenate((velocity, angular), axis=-1)
+    position = to_base.apply(poses[:, :3] - anchor[:3])
+    rotation = to_base.apply((rotations * reference.inv()).as_rotvec())
+    return np.concatenate((position, rotation), axis=-1)
 
 
-def integrate_twist(pose, twist, dt, world_from_base):
-    """Next pose after applying one base-frame twist for ``dt`` seconds."""
-    pose = np.asarray(pose, dtype=np.float64)
-    twist = np.asarray(twist, dtype=np.float64)
-    if pose.shape != (7,) or twist.shape != (6,):
-        raise ValueError("Expected a 7-D pose and a 6-D twist")
-    if not np.isfinite(twist).all() or not np.isfinite(dt) or dt <= 0:
-        raise ValueError("Twist and dt must be finite, dt positive")
-    rotation = wxyz_to_rotation(pose[3:])
-    position = pose[:3] + world_from_base.apply(twist[:3]) * dt
-    delta = Rotation.from_rotvec(world_from_base.apply(twist[3:]) * dt)
-    return np.concatenate((position, rotation_to_wxyz(delta * rotation)))
+def delta_to_target(anchor, offset, world_from_base):
+    """Absolute pose target from an anchor-relative offset (Eq. delta_to_target).
+
+    Exact inverse of :func:`anchor_deltas`: ``p = p_anchor + R_b a_pos`` and
+    ``R = Exp(R_b a_rot) R_anchor``. ``offset`` may be (6,) or (N,6).
+    """
+    anchor = np.asarray(anchor, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.float64)
+    single = offset.ndim == 1
+    offset = offset.reshape(-1, 6) if offset.shape[-1:] == (6,) else None
+    if anchor.shape != (7,) or offset is None:
+        raise ValueError("Expected a 7-D anchor pose and 6-D offsets")
+    if not np.isfinite(anchor).all() or not np.isfinite(offset).all():
+        raise ValueError("Anchor pose and offsets must be finite")
+    reference = wxyz_to_rotation(anchor[3:])
+    position = anchor[:3] + world_from_base.apply(offset[:, :3])
+    rotation = Rotation.from_rotvec(world_from_base.apply(offset[:, 3:])) * reference
+    target = np.concatenate((position, rotation_to_wxyz(rotation)), axis=-1)
+    return target[0] if single else target
 
 
 def pose_error(target, actual):

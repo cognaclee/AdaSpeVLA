@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: bash process_data.sh <bench_name> <ckpt_name> <env_cfg_type> <action_type>
-# Converts XPolicyLab trajectories into AdaSpeVLA's physical-twist contract.
+# Converts XPolicyLab trajectories into AdaSpeVLA's pose + gripper-width contract.
 # Output: data/<bench_name>-<ckpt_name>-<env_cfg_type>-<action_type>/<task_name>/
 # Environment:
 #   TASK_NAME     task to convert (default: ckpt_name; AdaSpeVLA trains per task)

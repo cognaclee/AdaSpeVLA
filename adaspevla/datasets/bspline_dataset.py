@@ -1,4 +1,4 @@
-"""Timestamped velocity demonstrations with consistent knot and timing targets."""
+"""Timestamped pose demonstrations as anchor-relative windows with knot and timing targets."""
 
 import numpy as np
 import torch
@@ -6,12 +6,15 @@ from torch.utils.data import Dataset
 from .action_contract import (
     canonicalize_episode,
     calibrate_motion_scales,
+    normalize_actions,
     validate_motion_scales,
+    window_offsets,
 )
-from ..bspline.curve_fitting import fit_bspline_control_points_least_squares
+from ..bspline.curve_fitting import fit_bspline_control_points_grouped
 from ..bspline.learnable_knots import (
     compute_curvature_density_target,
     intervals_to_knots,
+    motion_variation,
     query_interval_target,
 )
 
@@ -37,6 +40,8 @@ class UniversalBSplineDataset(Dataset):
         anticipation_margin=0.0,
         scale_floor=1e-6,
         per_arm_knots=False,
+        gripper_density_gain=10.0,
+        gripper_threshold=0.5,
     ):
         if per_arm_knots and action_dim != 14:
             raise ValueError("Per-arm knots require two arms (14 action channels)")
@@ -70,12 +75,18 @@ class UniversalBSplineDataset(Dataset):
         self.supported_horizons = supported_horizons
         self.control_dt = control_dt
         self.anticipation_margin = anticipation_margin
+        if not 0 <= gripper_density_gain < float("inf") or not 0 < gripper_threshold < 1:
+            raise ValueError("Invalid gripper density gain or gripper threshold")
+        # beta_g (Eq. density) and theta_g (event teacher; binary robots only).
+        self.gripper_density_gain = float(gripper_density_gain)
+        self.gripper_threshold = float(gripper_threshold)
+        self.num_arms = action_dim // 7
         self.include_diagnostic_targets = True
         self.samples = []
         prepared = []
         for original in episodes:
             ep = dict(original)
-            motion, gripper, times = canonicalize_episode(ep, action_dim)
+            poses, widths, times, world_from_base = canonicalize_episode(ep, action_dim)
             # A terminal command may be the endpoint; never select later samples.
             end = len(times)
             for key in ("terminated", "dones"):
@@ -98,68 +109,29 @@ class UniversalBSplineDataset(Dataset):
             for key in ("images", "criticality", "query_intervals"):
                 if key in ep:
                     ep[key] = np.asarray(ep[key])[:end]
-            prepared.append((ep, motion[:end], gripper[:end], times[:end]))
+            prepared.append(
+                (ep, poses[:end], widths[:end], times[:end], world_from_base)
+            )
         if not prepared:
             raise ValueError("No complete episodes before termination")
-        base_scales = (
-            calibrate_motion_scales([x[1] for x in prepared], scale_floor)
-            if motion_scale_values is None
-            else torch.as_tensor(motion_scale_values)
-        )
-        self.motion_scale_values = base_scales.tolist()
-        self.motion_scale = validate_motion_scales(base_scales, action_dim // 7)
-        rates = np.concatenate(
-            [
-                np.linalg.norm(
-                    np.diff(m / self.motion_scale.numpy(), axis=0)
-                    / np.diff(t)[:, None],
-                    axis=-1,
-                )
-                for _, m, _, t in prepared
-            ]
-        )
-        self.e_crit = float(
-            max(np.quantile(rates, event_quantile), 1e-6) if e_crit is None else e_crit
-        )
-        if not 0 < self.e_crit < float("inf"):
-            raise ValueError("e_crit must be finite and positive")
-        self.calibration = dict(
-            motion_scale_values=self.motion_scale_values,
-            scale_percentile=95,
-            scale_floor=scale_floor,
-            e_crit=self.e_crit,
-            event_quantile=event_quantile,
-            anticipation_margin=anticipation_margin,
-            control_dt=control_dt,
-            supported_horizons=supported_horizons,
-            action_frame="base",
-            action_type="twist",
-            motion_channels=["vx", "vy", "vz", "wx", "wy", "wz"],
-            motion_units=["m/s"] * 3 + ["rad/s"] * 3,
-        )
-        if self.per_arm_knots:
-            self.calibration["per_arm_knots"] = True
         conversions = [
             ep["conversion_metadata"]
-            for ep, _, _, _ in prepared
+            for ep, *_ in prepared
             if "conversion_metadata" in ep
         ]
-        if conversions:
-            if any(meta != conversions[0] for meta in conversions):
-                raise ValueError("Native conversion conventions differ across episodes")
-            self.calibration["source_conversion"] = conversions[0]
-        for ep, motion, gripper, times in prepared:
+        windows = []
+        for ep, poses, widths, times, world_from_base in prepared:
             images = np.asarray(ep["images"])
-            if len(images) != len(motion):
+            if len(images) != len(poses):
                 raise ValueError("Image and action sample counts must match")
             instruction = ep.get("instruction")
             if not isinstance(instruction, str) or not instruction.strip():
                 raise ValueError("Each episode requires a nonempty instruction")
             criticality = np.asarray(
-                ep.get("criticality", np.zeros(len(motion))), dtype=np.float32
+                ep.get("criticality", np.zeros(len(poses))), dtype=np.float32
             )
             if (
-                criticality.shape != (len(motion),)
+                criticality.shape != (len(poses),)
                 or not np.isfinite(criticality).all()
                 or ((criticality < 0) | (criticality > 1)).any()
             ):
@@ -167,15 +139,15 @@ class UniversalBSplineDataset(Dataset):
             labels = ep.get("query_intervals")
             if labels is not None:
                 labels = np.asarray(labels, dtype=np.float32)
-                if labels.shape != (len(motion),):
+                if labels.shape != (len(poses),):
                     raise ValueError(
                         "query_intervals must be length T; invalid values use fallback labels"
                     )
-            for start in range(0, len(motion) - 1, anchor_stride):
+            for start in range(0, len(poses) - 1, anchor_stride):
                 if supported_horizons is None:
                     stops = (
                         [start + chunk_horizon]
-                        if start + chunk_horizon <= len(motion)
+                        if start + chunk_horizon <= len(poses)
                         else []
                     )
                 else:
@@ -213,17 +185,80 @@ class UniversalBSplineDataset(Dataset):
                         <= min(duration, max_query_interval) + 1e-7
                     ):
                         label = None
-                    self.samples.append(
+                    # Eq. anchor_delta: every sample is re-anchored at T_k = times[start].
+                    offsets = window_offsets(poses[start:stop], world_from_base)
+                    raw = np.concatenate(
+                        (
+                            offsets.reshape(stop - start, self.num_arms, 6),
+                            widths[start:stop, :, None],
+                        ),
+                        axis=-1,
+                    ).reshape(stop - start, -1)
+                    windows.append(
                         (
                             images[start],
-                            motion[start:stop],
-                            gripper[start:stop],
+                            # float64 keeps second differences above rounding noise.
+                            raw,
                             times[start:stop] - times[start],
                             criticality[start:stop],
                             instruction,
                             label,
                         )
                     )
+        if not windows:
+            raise ValueError(
+                "No complete timestamped chunks; check the dataset and chunk_horizon"
+            )
+        motion_mask = np.ones(action_dim, dtype=bool)
+        motion_mask[6::7] = False
+        base_scales = (
+            calibrate_motion_scales([w[1][:, motion_mask] for w in windows], scale_floor)
+            if motion_scale_values is None
+            else torch.as_tensor(motion_scale_values)
+        )
+        self.motion_scale_values = base_scales.tolist()
+        self.motion_scale = validate_motion_scales(base_scales, self.num_arms)
+        if e_crit is None:
+            variation = np.concatenate(
+                [
+                    motion_variation(
+                        torch.from_numpy(w[1][:, motion_mask])[None]
+                        / self.motion_scale.double(),
+                        torch.from_numpy(w[2])[None],
+                    )[0].numpy()
+                    for w in windows
+                ]
+            )
+            e_crit = max(float(np.quantile(variation, event_quantile)), 1e-6)
+        self.e_crit = float(e_crit)
+        if not 0 < self.e_crit < float("inf"):
+            raise ValueError("e_crit must be finite and positive")
+        self.calibration = dict(
+            motion_scale_values=self.motion_scale_values,
+            scale_percentile=95,
+            scale_floor=scale_floor,
+            e_crit=self.e_crit,
+            event_quantile=event_quantile,
+            anticipation_margin=anticipation_margin,
+            control_dt=control_dt,
+            supported_horizons=supported_horizons,
+            action_frame="base",
+            action_type="anchor_delta",
+            motion_channels=["dx", "dy", "dz", "rx", "ry", "rz"],
+            motion_units=["m"] * 3 + ["rad"] * 3,
+            gripper_channel="width",
+            gripper_units="normalized [0,1], 0 closed, 1 open",
+            channel_order="per arm: six anchor-relative offsets, then gripper width",
+            gripper_density_gain=self.gripper_density_gain,
+            gripper_threshold=self.gripper_threshold,
+        )
+        if self.per_arm_knots:
+            self.calibration["per_arm_knots"] = True
+        if conversions:
+            if any(meta != conversions[0] for meta in conversions):
+                raise ValueError("Native conversion conventions differ across episodes")
+            self.calibration["source_conversion"] = conversions[0]
+        self.samples = windows
         if not self.samples:
             raise ValueError(
                 "No complete timestamped chunks; check the dataset and chunk_horizon"
@@ -233,9 +268,7 @@ class UniversalBSplineDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        image, motion, gripper, times, criticality, instruction, label = self.samples[
-            index
-        ]
+        image, raw, times, criticality, instruction, label = self.samples[index]
         image = torch.as_tensor(np.array(image, copy=True))
         if image.ndim == 3:
             image = image.unsqueeze(0)
@@ -248,23 +281,32 @@ class UniversalBSplineDataset(Dataset):
         image = image.float() / 255 if image.dtype == torch.uint8 else image.float()
         if not torch.isfinite(image).all() or ((image < 0) | (image > 1)).any():
             raise ValueError("Images must be uint8 RGB or floating RGB in [0,1]")
-        raw = torch.tensor(motion)
-        grip = torch.tensor(gripper)
-        stamps = torch.tensor(times, dtype=torch.float32)
-        risk = torch.tensor(criticality)
+        # Targets are computed in float64 and returned in float32.
+        raw = torch.from_numpy(raw)
+        stamps = torch.from_numpy(np.asarray(times, dtype=np.float64))
+        risk = torch.from_numpy(criticality).double()
         horizon = stamps[-1:].clone()
-        normalized = raw / self.motion_scale
-        blocks = normalized.chunk(2, -1) if self.per_arm_knots else (normalized,)
+        # Normalized joint action: motion / D and gripper 2w-1, seven channels per arm.
+        normalized = normalize_actions(raw, self.motion_scale.double())
+        arms = normalized.unflatten(-1, (self.num_arms, 7))
+        motion = arms[..., :6].flatten(-2)
+        widths = raw.unflatten(-1, (self.num_arms, 7))[..., 6]
+        if self.per_arm_knots:
+            blocks = [(arms[:, a, :6], widths[:, a : a + 1]) for a in range(self.num_arms)]
+        else:
+            blocks = [(motion, widths)]
         delta = torch.stack(
             [
                 compute_curvature_density_target(
-                    block[None],
+                    block_motion[None],
                     self.num_control_points - self.degree,
                     stamps[None],
                     self.min_interval_eps,
                     criticality=risk[None],
+                    gripper=block_width[None],
+                    gripper_gain=self.gripper_density_gain,
                 )[0]
-                for block in blocks
+                for block_motion, block_width in blocks
             ]
         )
         # Shared: delta (I,), knots (1,n). Per arm: delta (2,I), knots (1,2,n).
@@ -275,17 +317,14 @@ class UniversalBSplineDataset(Dataset):
             delta = delta[0]
         query_times = stamps / horizon
         if self.include_diagnostic_targets:
-            fits = [
-                fit_bspline_control_points_least_squares(
-                    block[None],
-                    self.num_control_points,
-                    self.degree,
-                    knots=knots[:, arm] if self.per_arm_knots else knots,
-                    query_times=query_times[None],
-                )[0]
-                for arm, block in enumerate(blocks)
-            ]
-            cp = torch.cat(fits, dim=-1)
+            # All channels, including the gripper width, share each arm's basis.
+            cp = fit_bspline_control_points_grouped(
+                normalized[None],
+                self.num_control_points,
+                self.degree,
+                knots=knots,
+                query_times=query_times[None],
+            )[0]
         target_interval = query_interval_target(
             # Span lengths only enter validation; the label comes from events.
             delta.reshape(-1, delta.shape[-1])[:1],
@@ -294,10 +333,11 @@ class UniversalBSplineDataset(Dataset):
             self.max_query_interval,
             stamps[None],
             risk[None],
-            grip[None],
-            normalized[None],
+            widths[None],
+            motion[None],
             e_crit=self.e_crit,
             anticipation_margin=self.anticipation_margin,
+            gripper_threshold=self.gripper_threshold,
         )[0]
         if label is not None:
             lower, upper = min(horizon.item(), self.min_query_interval), min(
@@ -307,28 +347,20 @@ class UniversalBSplineDataset(Dataset):
                 raise ValueError(
                     "Measured query interval lies outside configured horizon/interval bounds"
                 )
-            target_interval = torch.tensor([label])
-        # Discrete gripper labels are held, never interpolated or included in the spline.
-        grid = torch.linspace(0, 1, self.chunk_horizon)
-        indices = (
-            torch.searchsorted(query_times, grid, right=True)
-            .sub(1)
-            .clamp(0, len(grip) - 1)
-        )
+            target_interval = torch.tensor([label], dtype=torch.float64)
         record = {
             "images": image.contiguous(),
-            "raw_actions": raw,
-            "target_delta": delta,
-            "target_knots": knots[0],
-            "query_times": query_times,
-            "horizon_duration": horizon,
-            "target_query_interval": target_interval,
-            "target_gripper": grip[indices],
+            "raw_actions": raw.float(),
+            "target_delta": delta.float(),
+            "target_knots": knots[0].float(),
+            "query_times": query_times.float(),
+            "horizon_duration": horizon.float(),
+            "target_query_interval": target_interval.float(),
             "instructions": instruction,
             "timing_target_source": "measured" if label is not None else "heuristic",
         }
         if self.include_diagnostic_targets:
-            record["control_points"] = cp[0]
+            record["control_points"] = cp[0].float()
         return record
 
 

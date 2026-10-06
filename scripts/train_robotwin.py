@@ -68,7 +68,12 @@ def parse_args():
         action="store_true",
         help="Explicit small offline test backbone",
     )
-    parser.add_argument("--action_type", choices=["twist", "delta_twist"], default=None)
+    parser.add_argument(
+        "--action_type",
+        choices=["ee_pose", "twist", "delta_twist"],
+        default=None,
+        help="ee_pose (poses + widths); twist inputs are integrated into poses",
+    )
     parser.add_argument("--action_frame", choices=["base"], default=None)
     parser.add_argument(
         "--sample_dt",
@@ -96,7 +101,7 @@ def parse_args():
     )
     parser.add_argument(
         "--actions_path",
-        help="Converted physical action dataset path; does not convert joint/pose commands",
+        help="Twist action dataset path (integrated into poses); does not convert joint commands",
     )
     parser.add_argument(
         "--robotwin_native_right",
@@ -110,7 +115,6 @@ def parse_args():
         default=None,
         help="Robot base orientation in world; default is official aloha-agilex",
     )
-    parser.add_argument("--robotwin_gripper_threshold", type=float, default=0.5)
     parser.add_argument("--robotwin_simulation_dt", type=float, default=1 / 250)
     add_method_arguments(parser)
     return parser.parse_args()
@@ -147,7 +151,6 @@ def train():
         actions_path=args.actions_path,
         robotwin_native_right=args.robotwin_native_right,
         robotwin_base_wxyz=args.robotwin_base_wxyz,
-        robotwin_gripper_threshold=args.robotwin_gripper_threshold,
         robotwin_simulation_dt=args.robotwin_simulation_dt,
         action_type=args.action_type,
         action_frame=args.action_frame,

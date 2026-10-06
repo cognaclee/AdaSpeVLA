@@ -6,6 +6,9 @@ from torch.utils.data import DataLoader
 from ..datasets.bspline_dataset import collate_windows
 from ..models.adaspe_vla_policy import AdaSpeVLAPolicy
 
+# 4: anchor-relative offsets with a continuous gripper-width spline channel.
+CHECKPOINT_FORMAT = 4
+
 
 def add_method_arguments(parser):
     parser.add_argument("--timing_epochs", type=int, default=10)
@@ -31,7 +34,16 @@ def add_method_arguments(parser):
         "--flow_loss_coeff", type=float, default=1.0, help="gamma (flow-loss weight)"
     )
     parser.add_argument(
-        "--gripper_loss_coeff", type=float, default=1.0, help="eta in Eq. action_loss"
+        "--gripper_density_gain",
+        type=float,
+        default=10.0,
+        help="beta_g: gripper-width variation weight in the knot density (Eq. density)",
+    )
+    parser.add_argument(
+        "--gripper_threshold",
+        type=float,
+        default=0.5,
+        help="theta_g: width threshold for gripper events in the timing teacher",
     )
     parser.add_argument(
         "--knot_supervision",
@@ -57,7 +69,10 @@ def window_options(args):
             "event_quantile",
             "anticipation_margin",
             "scale_floor",
+            "gripper_density_gain",
+            "gripper_threshold",
         )
+        if hasattr(args, key)
     }
     if getattr(args, "per_arm_knots", False):
         options["per_arm_knots"] = True
@@ -69,7 +84,7 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         raise ValueError(
             "Both training stages require positive epoch counts and batch size"
         )
-    durations = torch.tensor([record[3][-1] for record in dataset.samples])
+    durations = torch.tensor([record[2][-1] for record in dataset.samples])
     horizon = (
         float(durations.median())
         if args.horizon_duration is None
@@ -87,7 +102,6 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         num_control_points=args.num_control_points,
         degree=args.degree,
         test_mode=args.test_backbone,
-        prediction_samples=args.chunk_horizon,
         motion_scale_values=dataset.motion_scale_values,
         timing_probe_count=args.timing_probe_count,
         timing_num_ode_steps=args.num_ode_steps,
@@ -98,7 +112,6 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         per_arm_knots=per_arm_knots,
         knot_loss_coeff=getattr(args, "knot_loss_coeff", 0.5),
         flow_loss_coeff=getattr(args, "flow_loss_coeff", 1.0),
-        gripper_loss_coeff=getattr(args, "gripper_loss_coeff", 1.0),
         knot_supervision=getattr(args, "knot_supervision", "kl"),
         uniform_knots=getattr(args, "uniform_knots", False),
     ).to(args.device)
@@ -145,7 +158,7 @@ def train_two_stage(args, dataset, benchmark, action_dim):
             checkpoint = dict(
                 model_state=policy.state_dict(),
                 model_config=policy.config,
-                format_version=3,
+                format_version=CHECKPOINT_FORMAT,
                 training_stage=stage,
                 epoch=epoch,
                 calibration=dataset.calibration,

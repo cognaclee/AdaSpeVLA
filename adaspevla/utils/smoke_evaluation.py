@@ -9,7 +9,8 @@ import torch
 
 from ..execution import SynchronousSplineExecutor
 from ..models.adaspe_vla_policy import AdaSpeVLAPolicy
-from .metrics import compute_trajectory_jerk
+from ..benchmarks.rollout import EpisodeRecorder
+from .training import CHECKPOINT_FORMAT
 
 
 def run_smoke_evaluation(
@@ -54,9 +55,10 @@ def run_smoke_evaluation(
 
     if args.ckpt_path:
         ckpt = torch.load(args.ckpt_path, map_location=args.device, weights_only=False)
-        if ckpt.get("format_version") != 3 or "model_config" not in ckpt:
+        if ckpt.get("format_version") != CHECKPOINT_FORMAT or "model_config" not in ckpt:
             raise ValueError(
-                "Checkpoint lacks the corrected action/timing contract; retrain with format_version=3"
+                "Checkpoint lacks the anchor-delta/continuous-gripper contract; "
+                f"retrain with format_version={CHECKPOINT_FORMAT}"
             )
         if ckpt.get("training_stage") != "timing":
             raise ValueError("Evaluation requires a checkpoint trained through stage 2")
@@ -88,8 +90,11 @@ def run_smoke_evaluation(
     )
     dt = 1.0 / args.control_freq
     steps = math.ceil(args.duration / dt)
+    identity = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
     for episode in range(args.num_episodes):
-        executed_actions = []
+        # Perfect tracking: each query's anchor is the last commanded pose target.
+        current = np.repeat(identity[None], policy.num_arms, axis=0)
+        targets = []
 
         def observe():
             return {
@@ -97,28 +102,31 @@ def run_smoke_evaluation(
                     1, policy.config["num_views"], 3, 224, 224, device=args.device
                 ),
                 "instructions": [f"perform {args.task_name}"],
+                "anchor_pose": current.copy(),
             }
+
+        def command(action):
+            pose = action.numpy().reshape(policy.num_arms, 8)[:, :7]
+            current[:] = pose
+            targets.append(pose.copy())
 
         executor = SynchronousSplineExecutor(
             policy,
             observe,
-            lambda action: executed_actions.append(action.numpy().copy()),
+            command,
             control_dt=dt,
             num_ode_steps=args.num_ode_steps,
+            command_type="pose",
         )
         started = time.perf_counter()
         for _ in range(steps):
             executor.step()
         wall_seconds = time.perf_counter() - started
-        actions = np.array(executed_actions).reshape(steps, policy.num_arms, 7)
-        linear_jerk = compute_trajectory_jerk(
-            actions[..., :3].reshape(steps, -1), dt=dt, representation="velocity"
-        )
-        angular_jerk = compute_trajectory_jerk(
-            actions[..., 3:6].reshape(steps, -1), dt=dt, representation="velocity"
-        )
+        recorder = EpisodeRecorder(dt, policy.num_arms)
+        smooth = recorder._target_smoothness(np.asarray(targets))
         print(
             f"Episode {episode + 1}: queries={executor.query_count}, "
             f"queries/sample-second={executor.query_count / (steps * dt):.2f}, "
-            f"wall-seconds={wall_seconds:.3f}, linear jerk energy={linear_jerk:.4f}, angular jerk energy={angular_jerk:.4f}"
+            f"wall-seconds={wall_seconds:.3f}, linear jerk energy={smooth['linear_jerk']:.4f}, "
+            f"angular jerk energy={smooth.get('angular_jerk', 0.0):.4f}"
         )

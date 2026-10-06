@@ -9,6 +9,10 @@ re-implementing Eq. (steps).
 ``QueryTimingPolicy`` optionally replaces the predicted interval with a fixed one.
 It is an evaluation baseline for the paper's fixed-vs-supervised ablation; the
 same checkpoint, knots, control points and grippers are used in both modes.
+
+Prefix actions are anchor-relative base-frame offsets plus clamped widths; the
+benchmark adapters map them to absolute pose targets from the pose observed at
+query time (Eq. delta_to_target) and pass those targets to ``EpisodeRecorder``.
 """
 
 import json
@@ -22,14 +26,17 @@ import torch
 from ..execution import SynchronousSplineExecutor
 from ..models.adaspe_vla_policy import AdaSpeVLAPolicy
 from ..utils.metrics import compute_chunk_boundary_jump, compute_trajectory_jerk
+from ..utils.training import CHECKPOINT_FORMAT
+from .pose_math import wxyz_to_rotation
 
 
 def load_policy(ckpt_path, device="cpu"):
-    """Load a completed stage-2 version-3 checkpoint strictly."""
+    """Load a completed stage-2 checkpoint of the anchor-delta contract strictly."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if ckpt.get("format_version") != 3 or "model_config" not in ckpt:
+    if ckpt.get("format_version") != CHECKPOINT_FORMAT or "model_config" not in ckpt:
         raise ValueError(
-            "Checkpoint lacks the corrected action/timing contract; retrain with format_version=3"
+            "Checkpoint lacks the anchor-relative action and continuous-gripper contract; "
+            f"retrain with format_version={CHECKPOINT_FORMAT}"
         )
     if ckpt.get("training_stage") != "timing":
         raise ValueError("Evaluation requires a checkpoint trained through stage 2")
@@ -103,7 +110,7 @@ class PrefixPlanner:
             num_ode_steps=(
                 policy.timing_num_ode_steps if num_ode_steps is None else num_ode_steps
             ),
-            command_type="twist",
+            command_type="anchor_delta",
             boundary_matching=boundary_matching,
             motion_limits=motion_limits,
         )
@@ -113,7 +120,11 @@ class PrefixPlanner:
         self._observation = None
 
     def plan(self, observation):
-        """Query once and return ``(actions (N, 7*arms), info)`` for the prefix."""
+        """Query once and return ``(actions (N, 7*arms), info)`` for the prefix.
+
+        Per arm each row is six offsets from the pose observed with this
+        observation, then the width clamped to [0,1].
+        """
         self._observation = observation
         # Every call follows a fresh observation: start a new prefix even if the
         # benchmark ended the previous one early.
@@ -147,17 +158,25 @@ class EpisodeRecorder:
     def reset(self):
         self.prefixes = []
         self.actions = []
+        self.targets = []
         self.tracking = []
         self.meta = {}
 
-    def add_prefix(self, actions, info):
+    def add_prefix(self, actions, info, targets=None):
+        """Record a prefix; ``targets`` (N, arms, 7) are the absolute pose targets."""
         self.prefixes.append(dict(info))
         self.actions.extend(np.asarray(actions))
+        if targets is not None:
+            targets = np.asarray(targets, dtype=np.float64).reshape(
+                len(actions), self.num_arms, 7
+            )
+            self.targets.extend(targets)
 
     def drop_unexecuted(self, count):
         """Forget the last ``count`` planned commands that were never executed."""
         if count > 0:
             self.actions = self.actions[: max(0, len(self.actions) - count)]
+            self.targets = self.targets[: len(self.actions)]
 
     def add_tracking(self, translation, rotation):
         self.tracking.append((float(translation), float(rotation)))
@@ -193,29 +212,10 @@ class EpisodeRecorder:
                 },
             )
         if steps:
-            arms = np.asarray(self.actions).reshape(steps, self.num_arms, 7)
-            record["linear_jerk"] = compute_trajectory_jerk(
-                arms[..., :3].reshape(steps, -1), self.control_dt, "velocity"
-            )
-            record["angular_jerk"] = compute_trajectory_jerk(
-                arms[..., 3:6].reshape(steps, -1), self.control_dt, "velocity"
-            )
-            jumps = []
-            start = 0
-            for p in self.prefixes:
-                end = min(start + p["prefix_steps"], steps)
-                if start >= 3 and end - start >= 3:
-                    jumps.append(
-                        compute_chunk_boundary_jump(
-                            arms[start - 3 : start, :, :6].reshape(3, -1),
-                            arms[start:end, :, :6].reshape(end - start, -1),
-                            self.control_dt,
-                            self.control_dt,
-                        )["c0_value_jump"]
-                    )
-                start = end
-            if jumps:
-                record["boundary_c0_jump_mean"] = float(np.mean(jumps))
+            widths = np.asarray(self.actions).reshape(steps, self.num_arms, 7)[..., 6]
+            record["gripper_width_mean"] = float(widths.mean())
+        if len(self.targets) == steps and steps:
+            record.update(self._target_smoothness(np.asarray(self.targets)))
         if self.tracking:
             tracking = np.array(self.tracking)
             record.update(
@@ -223,6 +223,43 @@ class EpisodeRecorder:
                 tracking_rotation_rad_mean=float(tracking[:, 1].mean()),
             )
         return record
+
+    def _target_smoothness(self, targets):
+        """Linear/angular jerk of the commanded pose targets and boundary jumps."""
+        steps, dt = len(targets), self.control_dt
+        positions = targets[..., :3].reshape(steps, -1)
+        result = dict(linear_jerk=compute_trajectory_jerk(positions, dt, "position"))
+        if steps >= 2:
+            angular = np.stack(
+                [
+                    (
+                        wxyz_to_rotation(targets[1:, arm, 3:])
+                        * wxyz_to_rotation(targets[:-1, arm, 3:]).inv()
+                    ).as_rotvec()
+                    / dt
+                    for arm in range(self.num_arms)
+                ],
+                axis=1,
+            ).reshape(steps - 1, -1)
+            result["angular_jerk"] = compute_trajectory_jerk(angular, dt, "velocity")
+            # Velocity jump of the commanded targets at each new prefix.
+            velocity = np.diff(positions, axis=0) / dt
+            jumps, start = [], 0
+            for p in self.prefixes:
+                end = min(start + p["prefix_steps"], steps)
+                if start >= 4 and end - start >= 3:
+                    jumps.append(
+                        compute_chunk_boundary_jump(
+                            velocity[start - 4 : start - 1],
+                            velocity[start - 1 : end - 1],
+                            dt,
+                            dt,
+                        )["c0_value_jump"]
+                    )
+                start = end
+            if jumps:
+                result["boundary_velocity_jump_mean"] = float(np.mean(jumps))
+        return result
 
 
 def append_jsonl(path, record):
@@ -270,7 +307,7 @@ def summarize_records(records):
                 tracking_rotation_rad_mean=mean("tracking_rotation_rad_mean"),
                 linear_jerk=mean("linear_jerk"),
                 angular_jerk=mean("angular_jerk"),
-                boundary_c0_jump_mean=mean("boundary_c0_jump_mean"),
+                boundary_velocity_jump_mean=mean("boundary_velocity_jump_mean"),
             )
         )
     return rows

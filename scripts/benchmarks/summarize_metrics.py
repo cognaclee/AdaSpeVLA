@@ -25,6 +25,7 @@ COLUMNS = [
     ("tracking_translation_m_mean", "track_m"),
     ("linear_jerk", "lin_jerk"),
     ("angular_jerk", "ang_jerk"),
+    ("boundary_velocity_jump_mean", "bnd_vel_jump"),
 ]
 
 

@@ -1,4 +1,9 @@
-"""Knot-conditioned velocity splines with a supervised query-interval head."""
+"""Knot-conditioned anchor-relative action splines with a supervised query-interval head.
+
+One flow generates the control points of every channel: per arm, six
+anchor-relative base-frame motion offsets and the gripper opening width
+(manuscript Sec. joint flow generation). There is no separate gripper head.
+"""
 
 import torch
 from torch import nn
@@ -13,7 +18,12 @@ from ..bspline.learnable_knots import (
 )
 from ..bspline.curve_fitting import fit_bspline_control_points_least_squares
 from ..bspline.continuity_refit import BoundaryRefitter
-from ..datasets.action_contract import validate_motion_scales
+from ..datasets.action_contract import (
+    denormalize_actions,
+    motion_channel_mask,
+    normalize_actions,
+    validate_motion_scales,
+)
 
 
 class AdaSpeVLAPolicy(nn.Module):
@@ -28,9 +38,7 @@ class AdaSpeVLAPolicy(nn.Module):
         freeze_vlm=True,
         knot_loss_coeff=0.5,
         device="cpu",
-        gripper_loss_coeff=1.0,
         horizon_duration=0.3,
-        prediction_samples=16,
         min_query_interval=0.02,
         max_query_interval=0.5,
         min_interval_eps=0.01,
@@ -52,18 +60,18 @@ class AdaSpeVLAPolicy(nn.Module):
             raise ValueError("knot_supervision must be 'kl' or 'position'")
         if not flow_loss_coeff > 0:
             raise ValueError("flow_loss_coeff must be positive")
-        # Table 1 loss weights (alpha, gamma, eta) = (knot, flow, gripper).
+        # Table 1 loss weights (alpha, gamma) = (knot, flow); the gripper width is
+        # a flow channel, so there is no separate gripper loss.
         self.flow_loss_coeff = float(flow_loss_coeff)
         # Manuscript default: span KL. "position" is the L_pos alternative.
         self.knot_supervision = knot_supervision
         # Ablation: fixed uniform knots instead of the learned knot head.
         self.uniform_knots = bool(uniform_knots)
-        if action_dim not in (7, 14) or prediction_samples < 2:
-            raise ValueError(
-                "Require 7 or 14 action channels and at least two prediction samples"
-            )
+        if action_dim not in (7, 14):
+            raise ValueError("Require 7 or 14 action channels (six offsets and a width per arm)")
         self.action_dim, self.num_arms = action_dim, action_dim // 7
         self.motion_dim = 6 * self.num_arms
+        self.gripper_channels = list(range(6, action_dim, 7))
         if per_arm_knots and self.num_arms != 2:
             raise ValueError("Per-arm knots require two arms (14 action channels)")
         # Ablation (not the manuscript default): one knot partition per arm.
@@ -74,14 +82,8 @@ class AdaSpeVLAPolicy(nn.Module):
             degree,
             cond_dim,
         )
-        self.prediction_samples, self.horizon_duration = (
-            prediction_samples,
-            horizon_duration,
-        )
-        self.knot_loss_coeff, self.gripper_loss_coeff = (
-            knot_loss_coeff,
-            gripper_loss_coeff,
-        )
+        self.horizon_duration = horizon_duration
+        self.knot_loss_coeff = knot_loss_coeff
         self.config = dict(
             vlm_name=vlm_name,
             action_dim=action_dim,
@@ -91,9 +93,7 @@ class AdaSpeVLAPolicy(nn.Module):
             num_views=num_views,
             freeze_vlm=freeze_vlm,
             knot_loss_coeff=knot_loss_coeff,
-            gripper_loss_coeff=gripper_loss_coeff,
             horizon_duration=horizon_duration,
-            prediction_samples=prediction_samples,
             min_query_interval=min_query_interval,
             max_query_interval=max_query_interval,
             min_interval_eps=min_interval_eps,
@@ -143,6 +143,9 @@ class AdaSpeVLAPolicy(nn.Module):
         self.register_buffer(
             "motion_scale", validate_motion_scales(motion_scale_values, self.num_arms)
         )
+        self.register_buffer(
+            "motion_mask", motion_channel_mask(action_dim), persistent=False
+        )
         self.vlm = MultiCameraVLMBackbone(
             vlm_name, cond_dim, num_views, freeze_vlm, test_mode=test_mode
         )
@@ -155,28 +158,23 @@ class AdaSpeVLAPolicy(nn.Module):
             min_interval_eps=min_interval_eps,
             num_groups=self.knot_groups,
         )
-        # Both generator and discrete gripper head see the exact knots and duration.
+        # The generator sees the exact knots and duration (conditioning c~).
         context_dim = cond_dim + self.knot_groups * (num_control_points + degree + 1) + 1
         self.flow_policy = BSplineFlowMatchingPolicy(
             num_control_points,
-            self.motion_dim,
+            action_dim,
             context_dim,
             hidden_dim=flow_hidden_dim,
             num_layers=flow_num_layers,
             num_heads=flow_num_heads,
         )
-        self.gripper_head = nn.Sequential(
-            nn.Linear(context_dim, cond_dim),
-            nn.SiLU(),
-            nn.Linear(cond_dim, prediction_samples * self.num_arms),
-        )
         self.spline_evaluator = BSplineEvaluator(degree, num_control_points)
+        # Features: c, log H, spans, and R probes of every motion and width channel.
         timing_dim = (
             cond_dim
             + 1
             + self.knot_groups * (num_control_points - degree)
-            + timing_probe_count * self.motion_dim
-            + prediction_samples * self.num_arms
+            + timing_probe_count * action_dim
         )
         self.freq_head = nn.Sequential(
             nn.Linear(timing_dim, 128), nn.SiLU(), nn.Linear(128, 1)
@@ -205,16 +203,18 @@ class AdaSpeVLAPolicy(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         if getattr(self, "training_stage", None) == "timing":
-            for module in (
-                self.vlm,
-                self.knot_head,
-                self.flow_policy,
-                self.gripper_head,
-            ):
+            for module in (self.vlm, self.knot_head, self.flow_policy):
                 module.eval()
         return self
 
-    def _timing_interval(self, cond, delta, knots, horizon, physical_cp, grip_logits):
+    def _sample_control_points(self, context, num_steps):
+        """Euler-integrate the flow; P_0 motion is fixed to zero, then restore units."""
+        normalized = self.flow_policy.sample(context, num_steps=num_steps)
+        normalized[:, 0, self.motion_mask] = 0
+        return denormalize_actions(normalized, self.motion_scale)
+
+    def _timing_interval(self, cond, delta, knots, horizon, physical_cp):
+        """Eqs. timing_motion_probe--query_map: probe motion and clamped widths."""
         probes = torch.linspace(
             0,
             1,
@@ -222,14 +222,16 @@ class AdaSpeVLAPolicy(nn.Module):
             device=physical_cp.device,
             dtype=physical_cp.dtype,
         )
-        motion = self.spline_evaluator(physical_cp.detach(), knots.detach(), probes)[0]
+        values = self.spline_evaluator(physical_cp.detach(), knots.detach(), probes)[0]
+        motion = values[..., self.motion_mask]
+        width = values[..., ~self.motion_mask].clamp(0, 1)
         features = torch.cat(
             (
                 cond,
                 horizon.log(),
                 delta.detach().flatten(1),
                 motion.flatten(1).detach(),
-                grip_logits.flatten(1).detach(),
+                width.flatten(1).detach(),
             ),
             dim=-1,
         )
@@ -245,16 +247,10 @@ class AdaSpeVLAPolicy(nn.Module):
             horizon = duration_tensor(batch["horizon_duration"], cond)
             knots, delta = self._predict_knots(cond, horizon)
             context = self._context(cond, knots, horizon)
-            physical_cp = (
-                self.flow_policy.sample(context, num_steps=self.timing_num_ode_steps)
-                * self.motion_scale
+            physical_cp = self._sample_control_points(
+                context, self.timing_num_ode_steps
             )
-            logits = self.gripper_head(context).reshape(
-                -1, self.prediction_samples, self.num_arms
-            )
-        interval = self._timing_interval(
-            cond, delta, knots, horizon, physical_cp, logits
-        )
+        interval = self._timing_interval(cond, delta, knots, horizon, physical_cp)
         target = batch["target_query_interval"].reshape(-1, 1)
         lower = horizon.clamp(max=self.knot_head.min_query_interval)
         upper = horizon.clamp(max=self.knot_head.max_query_interval)
@@ -307,7 +303,7 @@ class AdaSpeVLAPolicy(nn.Module):
         return torch.cat((cond, knots.flatten(1), horizon.log()), dim=-1)
 
     def _fit_control_points(self, motion, knots, query_times):
-        """Fit on the shared partition, or each arm's channels on its own partition."""
+        """Fit on the shared partition, or each arm's seven channels on its own partition."""
         if knots.ndim == 2:
             return fit_bspline_control_points_least_squares(
                 motion,
@@ -332,22 +328,24 @@ class AdaSpeVLAPolicy(nn.Module):
         )
 
     def forward_loss(self, batch):
-        """Fit labels on current predicted knots; train flow, spans, timing and gripper."""
+        """Fit labels on current predicted knots; train flow (motion+width) and spans."""
         if self.training_stage == "timing":
             return self.forward_timing_loss(batch)
         cond = self.vlm(batch["images"], instructions=batch["instructions"])
         horizon = duration_tensor(batch["horizon_duration"], cond)
         knots, delta = self._predict_knots(cond, horizon)
         # Fit each timestamped window at its actual length; never pad the fit.
-        motions = batch["raw_actions"]
+        actions = batch["raw_actions"]
         times = batch["query_times"]
         targets, errors = [], []
         with torch.no_grad():
-            for index, motion in enumerate(motions):
-                if motion.shape[-1] != self.motion_dim:
-                    raise ValueError("raw_actions must contain physical motion only")
+            for index, action in enumerate(actions):
+                if action.shape[-1] != self.action_dim:
+                    raise ValueError(
+                        "raw_actions must contain six offsets and a width per arm"
+                    )
                 cp, error = self._fit_control_points(
-                    (motion / self.motion_scale).unsqueeze(0),
+                    normalize_actions(action, self.motion_scale).unsqueeze(0),
                     knots[index : index + 1].detach(),
                     times[index].unsqueeze(0),
                 )
@@ -371,30 +369,14 @@ class AdaSpeVLAPolicy(nn.Module):
                 "target_delta must be a positive normalized span distribution"
             )
         knot_loss = self._knot_loss(delta, target_delta)
-        grip_logits = self.gripper_head(context).reshape(
-            -1, self.prediction_samples, self.num_arms
-        )
-        grip_target = batch["target_gripper"]
-        if (
-            grip_target.shape != grip_logits.shape
-            or not ((grip_target == 0) | (grip_target == 1)).all()
-        ):
-            raise ValueError(
-                "Expected binary gripper labels on the configured prediction grid"
-            )
-        gripper_loss = F.binary_cross_entropy_with_logits(grip_logits, grip_target)
-        total = (
-            self.flow_loss_coeff * flow_loss
-            + self.knot_loss_coeff * knot_loss
-            + self.gripper_loss_coeff * gripper_loss
-        )
+        # Eq. action_loss: gamma L_flow + alpha KL; no separate gripper term.
+        total = self.flow_loss_coeff * flow_loss + self.knot_loss_coeff * knot_loss
         logs = {
             name: value.detach().item()
             for name, value in dict(
                 total_loss=total,
                 flow_loss=flow_loss,
                 knot_loss=knot_loss,
-                gripper_loss=gripper_loss,
                 reconstruction_mse=recon.mean(),
                 avg_horizon_s=horizon.mean(),
             ).items()
@@ -410,10 +392,14 @@ class AdaSpeVLAPolicy(nn.Module):
         boundary_value=None,
         num_ode_steps=None,
     ):
-        """Return physical base-frame velocity CPs and separate discrete grippers.
+        """Return physical control points of anchor-relative offsets and widths.
 
-        The optional boundary value is the last emitted physical twist (Eq. boundary);
-        it replaces control point zero only. The caller chooses a trained horizon.
+        Per arm, channels are six base-frame offsets from the anchor pose observed
+        at query time (metres, axis-angle radians) and the gripper width; widths
+        are not clamped here (execution clamps to [0,1]). The optional boundary
+        value (B, arms) is the last emitted clamped width (Eq. boundary); it
+        replaces the width entry of control point zero only. The caller chooses a
+        trained horizon.
         """
         self.eval()
         cond = self.vlm(images, instructions=instructions)
@@ -429,21 +415,16 @@ class AdaSpeVLAPolicy(nn.Module):
             num_ode_steps = self.timing_num_ode_steps
         knots, delta = self._predict_knots(cond, horizon)
         context = self._context(cond, knots, horizon)
-        cp = (
-            self.flow_policy.sample(context, num_steps=num_ode_steps)
-            * self.motion_scale
-        )
+        cp = self._sample_control_points(context, num_ode_steps)
         if boundary_value is not None:
             cp = BoundaryRefitter.refit_boundary_control_points(
                 cp,
                 knots,
                 boundary_value,
                 self.degree,
+                channels=self.gripper_channels,
             )
-        gripper = self.gripper_head(context).reshape(
-            -1, self.prediction_samples, self.num_arms
-        )
-        interval = self._timing_interval(cond, delta, knots, horizon, cp, gripper)
+        interval = self._timing_interval(cond, delta, knots, horizon, cp)
         return {
             "control_points": cp,
             "knots": knots,
@@ -451,10 +432,6 @@ class AdaSpeVLAPolicy(nn.Module):
             "horizon_duration": horizon,
             "query_interval": interval,
             "query_hz": interval.reciprocal(),
-            "gripper_commands": torch.where(gripper >= 0, 1.0, -1.0),
-            "gripper_times": torch.linspace(
-                0, 1, self.prediction_samples, device=cp.device
-            ),
-            "action_type": "twist",
+            "action_type": "anchor_delta",
             "action_frame": "base",
         }
