@@ -21,7 +21,7 @@ RoboCasa365, and the XPolicyLab adapter) are in
 | Train and evaluate on RoboDojo | [docs/benchmarks.md, Part B](docs/benchmarks.md#part-b-robodojo-through-the-same-adapter) |
 | Train and evaluate on RoboCasa365 | [docs/benchmarks.md, Part C](docs/benchmarks.md#part-c-robocasa365) |
 | Run the shared vs per-arm knot ablation | [docs/benchmarks.md, Part D](docs/benchmarks.md#part-d-bimanual-knot-ablation-shared-vs-per-arm-knots) |
-| Split raw RoboTwin / RoboCasa demos into difficulty-adaptive spline segments | `python -m scripts.benchmarks.segment_demos --help` (see `adaspevla/datasets/segmentation.py`) |
+| Split raw RoboTwin / RoboCasa demos into difficulty-adaptive spline segments | [Segment demonstrations into adaptive action chunks](#segment-demonstrations-into-adaptive-action-chunks) and [result.md](result.md) |
 
 All commands run from the repository root unless a step says otherwise.
 
@@ -159,6 +159,65 @@ python -m scripts.train_robotwin --data_dir /path/to/converted/data --task_name 
 Data from RoboTwin 2.0, RoboDojo or RoboCasa365 should go through the benchmark
 converters in [docs/benchmarks.md](docs/benchmarks.md) instead, which write this
 contract for you.
+
+## Segment demonstrations into adaptive action chunks
+
+`scripts.benchmarks.segment_demos` splits raw demonstrations into
+variable-length action chunks, each fitted by one cubic B-spline with a fixed
+number of control points. Easy free-space motion gets long chunks and grasps
+get short ones. Raw files are only read; everything is written to
+`--output_dir`. The method is in
+`adaspevla/datasets/segmentation.py`, and statistics on RoboTwin are in
+[result.md](result.md).
+
+How a demo is split:
+
+1. Cut at keyframes: samples where every arm comes to rest, or where a gripper
+   width starts or stops changing.
+2. Give every interval a precision demand `rho` (mainly gripper activity, plus
+   optional criticality labels) and a per-sample tolerance `tolerance / rho`.
+3. Inside each keyframe interval, grow a chunk as long as its spline fit
+   (anchor-relative offsets re-anchored at the chunk start, paper teacher
+   knots) keeps every sample within tolerance, its density mass
+   `sum(rho * dt)` stays below `--mass_budget_s`, and its length stays within
+   `[--min_samples, --max_samples]`. Adjacent chunks share their boundary
+   sample, which is the next anchor.
+
+```bash
+# RoboTwin 2.0 / XPolicyLab v1.0 HDF5 (both arms, segmented jointly)
+python -m scripts.benchmarks.segment_demos --format robotwin \
+    --source_dir /path/to/RoboTwin/data/demo_clean/beat_block_hammer/aloha_agilex/data \
+    --output_dir ./data/segments/robotwin/beat_block_hammer --plot 3
+
+# RoboCasa365 LeRobot v2.1 (videos are not decoded)
+python -m scripts.benchmarks.segment_demos --format robocasa \
+    --source_dir /path/to/lerobot --output_dir ./data/segments/robocasa/<task>
+```
+
+Output: one `<episode>.segments.json` per episode (`boundaries`, `keyframes`,
+per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
+`knot_spans`, and per-interval `density`), `segments_summary.json`, and with
+`--plot N` a PNG for the first N episodes. Read a file back with
+`adaspevla.datasets.segmentation.load_segments`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--num_control_points`, `--degree` | `8`, `3` | Spline per chunk |
+| `--min_samples`, `--max_samples` | `8`, `64` | Chunk length limits in samples; keyframes closer than `min_samples - 1` intervals are dropped |
+| `--tolerance` | `0.1` | Base fit tolerance in normalized units (offsets / D, gripper 2w-1); divided by `rho` |
+| `--mass_budget_s` | `3.0` | Max `sum(rho * dt)` per chunk, so a region of demand `rho` gets chunks of at most `3/rho` s |
+| `--keyframes` / `--no-keyframes` | on | Cut at stops and gripper-change edges first |
+| `--stop_fraction` | `0.05` | "At rest" = speed below this fraction of the episode's 95th-percentile speed |
+| `--gripper_eps` | `1e-3` | Width change per sample that counts as gripper motion |
+| `--gripper_gain`, `--gripper_ref` | `10`, `1` | Gripper term of `rho` (paper beta_g, e^g_ref) |
+| `--speed_gain`, `--speed_ref`, `--speed_fraction` | `0`, calibrated, `0.25` | Optional slow-motion precision term |
+| `--accel_gain`, `--accel_ref` | `0`, `1` | Optional paper e_j term (saturates on RoboTwin, so off) |
+| `--criticality_gain` | `10` | Weight of optional criticality labels |
+| `--dilation_s` | `0.15` | Spread `rho` to neighbouring samples (seconds) |
+| `--knot_density_gain` | `10` | Paper beta for the teacher knots inside a chunk |
+| `--scale_horizon` | `16` | Window length used to calibrate the motion scales D |
+| `--arms`, `--profile`, `--base_wxyz`, `--sample_dt` | `left right`, `robotwin` | RoboTwin reading options, as in the converter |
+| `--base_motion` | `drop` | RoboCasa episodes that move the mobile base |
 
 ## Training options (all training scripts)
 
