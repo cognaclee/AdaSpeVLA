@@ -21,6 +21,7 @@ RoboCasa365, and the XPolicyLab adapter) are in
 | Train and evaluate on RoboDojo | [docs/benchmarks.md, Part B](docs/benchmarks.md#part-b-robodojo-through-the-same-adapter) |
 | Train and evaluate on RoboCasa365 | [docs/benchmarks.md, Part C](docs/benchmarks.md#part-c-robocasa365) |
 | Run the shared vs per-arm knot ablation | [docs/benchmarks.md, Part D](docs/benchmarks.md#part-d-bimanual-knot-ablation-shared-vs-per-arm-knots) |
+| Split raw RoboTwin / RoboCasa demos into difficulty-adaptive spline segments | `python -m scripts.benchmarks.segment_demos --help` (see `adaspevla/datasets/segmentation.py`) |
 
 All commands run from the repository root unless a step says otherwise.
 

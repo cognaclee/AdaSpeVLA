@@ -123,10 +123,11 @@ class LeRobotV21:
         return decode_video(path)
 
 
-def convert_episode(dataset, episode_index, cameras=None, base_motion="error"):
-    """Return contract fields for one RoboCasa episode, or None if it is dropped."""
-    cameras = list(cameras or DEFAULT_CAMERAS)
-    df = dataset.frames(episode_index)
+def episode_trajectory(df, episode_index, base_motion="error"):
+    """Base-frame poses (T,7 wxyz), binary open widths (T,), times and base flag.
+
+    Returns None when ``base_motion='drop'`` and the episode moves the base.
+    """
     state = _column(df, "observation.state")
     action = _column(df, "action")
     times = np.asarray(df["timestamp"], dtype=np.float64)
@@ -152,6 +153,17 @@ def convert_episode(dataset, episode_index, cameras=None, base_motion="error"):
     grip_cmd = action[:, ACTION_GRIPPER_CLOSE]
     gripper_open = (grip_cmd <= 0).astype(np.float64)
     gripper_open = np.concatenate((gripper_open[:1], gripper_open[:-1]))
+    return pose, gripper_open, times, bool(moved)
+
+
+def convert_episode(dataset, episode_index, cameras=None, base_motion="error"):
+    """Return contract fields for one RoboCasa episode, or None if it is dropped."""
+    cameras = list(cameras or DEFAULT_CAMERAS)
+    df = dataset.frames(episode_index)
+    trajectory = episode_trajectory(df, episode_index, base_motion)
+    if trajectory is None:
+        return None
+    pose, gripper_open, times, moved = trajectory
     views = [dataset.video(episode_index, c) for c in cameras]
     for camera, view in zip(cameras, views):
         if len(view) != len(times):
