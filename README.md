@@ -18,7 +18,7 @@ All commands run from the repository root unless a step says otherwise.
 | Train on HDF5 data I already converted | [Step 4](#step-4-train-on-already-converted-hdf5-data) |
 | Use the vision-language encoder of pi0, pi0.5 or GR00T instead of SigLIP | [Step 5](#step-5-choose-the-backbone) |
 | Look up a training option | [Training options](#training-options-all-training-scripts) |
-| Train and evaluate the RoboTwin / RoboCasa suite on Jean Zay (Slurm) | [Quick start on Jean Zay](#quick-start-on-jean-zay), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
+| Train and evaluate the RoboTwin / RoboCasa suite with Slurm | [Quick start on Jean Zay](#quick-start-on-cluster), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
 | Train and evaluate on RoboTwin 2.0 through XPolicyLab | [docs/benchmarks.md, Part A](docs/benchmarks.md#part-a-robotwin-20-through-the-xpolicylab-adapter) |
 | Train and evaluate on RoboDojo | [docs/benchmarks.md, Part B](docs/benchmarks.md#part-b-robodojo-through-the-same-adapter) |
 | Train and evaluate on RoboCasa365 | [docs/benchmarks.md, Part C](docs/benchmarks.md#part-c-robocasa365) |
@@ -26,7 +26,7 @@ All commands run from the repository root unless a step says otherwise.
 | Split demos into difficulty-adaptive spline segments | [Segment demonstrations](#segment-demonstrations-into-adaptive-action-chunks), [result.md](result.md) |
 | Run the policy on my own robot | [Using the policy in your own control loop](#using-the-policy-in-your-own-control-loop) |
 
-## Quick start on Jean Zay
+## Quick start on cluster
 
 Training and evaluation run as self-contained `.slurm` files submitted with a
 plain `sbatch <file>.slurm`; each file sets its account, GPU type, task rows
@@ -46,12 +46,6 @@ python -m scripts.benchmarks.summarize_metrics eval_metrics/<run>-robotwin/robot
 | File | What it runs |
 |---|---|
 | `run.slurm` | Basic training with epoch defaults (H100); add `#SBATCH --array=<task rows>` before use |
-| `pilot_train_noaug.slurm` | Current recipe: patch tokens, robot state, vision finetune stage, no augmentation (V100) |
-| `eval.slurm`, `eval_robotwin.slurm` | Simulator evaluation, RoboCasa / sharded RoboTwin (H100) |
-| `backbone_train.slurm` | Backbone comparison: SigLIP, pi0, pi0.5, GR00T on four dev tasks (A100) |
-| `backbone_eval_robotwin.slurm`, `backbone_eval_robocasa.slurm` | Evaluation of the backbone comparison (H100) |
-| `bench_v100.slurm`, `bench_backbones_a100.slurm` | Speed and memory measurements before sizing step budgets |
-
 ---
 
 ## Step 1: Install
