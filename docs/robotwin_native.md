@@ -54,8 +54,9 @@ python -m scripts.train_robotwin \
 ```
 
 Training prints a warning that timing is approximate (see "Timing limitation"
-below); that is expected. Stage 1 trains the action predictor, stage 2 the
-query-timing head. Output:
+below); that is expected. Training runs three stages: `action` (action
+predictor, SigLIP frozen), `finetune` (also the last 4 SigLIP vision blocks;
+`--vision_finetune_layers 0` skips it) and `timing` (query-timing head). Output:
 `./checkpoints/robotwin_right/adaspevla_robotwin_beat_block_hammer_latest.pt`.
 
 Options for this mode:

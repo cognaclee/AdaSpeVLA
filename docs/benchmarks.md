@@ -11,6 +11,16 @@ This guide trains and evaluates AdaSpeVLA in simulation:
 
 Install AdaSpeVLA first ([README, Step 1](../README.md#step-1-install)).
 
+On Jean Zay, use the Slurm files described in
+[docs/slurm_benchmarks.md](slurm_benchmarks.md) instead of running these steps by
+hand. They wrap the same converter, trainer and evaluators.
+
+Training runs three stages (`action`, `finetune`, `timing`). The observation
+options default to on: SigLIP patch tokens, robot state, augmentation and a
+4-block SigLIP finetune. The `--epochs 20 --timing_epochs 10` commands below
+therefore also run a 5-epoch finetune stage. All options are in the
+[README training table](../README.md#training-options-all-training-scripts).
+
 > **About simulator installation.** The install and download commands for
 > RoboTwin, XPolicyLab, RoboDojo and RoboCasa come from those projects, not from
 > this repository, and were not run here. If one fails, follow that project's own
@@ -20,7 +30,7 @@ Install AdaSpeVLA first ([README, Step 1](../README.md#step-1-install)).
 Set these once per shell; every command below uses them:
 
 ```bash
-export ADASPEVLA_ROOT=/home/lzezeng/codes/AdaSpeVLA   # this repository
+export ADASPEVLA_ROOT=/path/to/AdaSpeVLA               # this repository
 export ROBOTWIN_ROOT=/path/to/RoboTwin                # your RoboTwin 2.0 checkout
 export XPL_ROOT=${ROBOTWIN_ROOT}/XPolicyLab           # XPolicyLab checkout used by RoboTwin
 export POLICY_DIR=${XPL_ROOT}/policy/AdaSpeVLA        # where the adapter gets installed
@@ -568,12 +578,15 @@ scores, so they show little about feedback timing.
 
 ### Validation status
 
-Run offline here: the full test suite (119 tests, including the benchmark
-tests in `tests/benchmarks/`). They cover anchor-offset round trips, the converters, timing
+The test suite in `tests/` (including `tests/benchmarks/`) was written for this
+part; it is not fully green now, see [README, Step 2](../README.md#step-2-check-the-installation). They cover anchor-offset round trips, the converters, timing
 profiles, the executor step rule, the XPolicyLab model, the convert-then-train
 CLIs, the RoboCasa closed loop against a stub environment, and the per-arm knot
 ablation. The adapter also ran end to end through XPolicyLab's policy server
 with the debug client (`EVAL_ENV_TYPE=debug`).
 
-**Not run here:** RoboTwin (SAPIEN with CuRobo), RoboDojo (Isaac Sim) and
-RoboCasa365 simulation. Nothing here measures task success yet.
+RoboTwin (SAPIEN with CuRobo) and RoboCasa365 closed-loop simulation now run
+on Jean Zay through the Slurm files in
+[docs/slurm_benchmarks.md](slurm_benchmarks.md). Measured success rates are in
+`eval_metrics/` and analysed in `analysis_low_success.md`. RoboDojo (Isaac Sim)
+has not been run.
