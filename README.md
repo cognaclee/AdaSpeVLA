@@ -18,7 +18,7 @@ All commands run from the repository root unless a step says otherwise.
 | Train on HDF5 data I already converted | [Step 4](#step-4-train-on-already-converted-hdf5-data) |
 | Use the vision-language encoder of pi0, pi0.5 or GR00T instead of SigLIP | [Step 5](#step-5-choose-the-backbone) |
 | Look up a training option | [Training options](#training-options-all-training-scripts) |
-| Train and evaluate the RoboTwin / RoboCasa suite with Slurm | [Quick start on Jean Zay](#quick-start-on-cluster), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
+| Train and evaluate the RoboTwin / RoboCasa suite with Slurm | [Quick start on cluster](#quick-start-on-cluster), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
 | Train and evaluate on RoboTwin 2.0 through XPolicyLab | [docs/benchmarks.md, Part A](docs/benchmarks.md#part-a-robotwin-20-through-the-xpolicylab-adapter) |
 | Train and evaluate on RoboDojo | [docs/benchmarks.md, Part B](docs/benchmarks.md#part-b-robodojo-through-the-same-adapter) |
 | Train and evaluate on RoboCasa365 | [docs/benchmarks.md, Part C](docs/benchmarks.md#part-c-robocasa365) |
@@ -70,8 +70,7 @@ pip install -e ".[dev]"
 
 The backbone is the frozen vision-language encoder that turns camera images and
 the instruction into features ([Step 5](#step-5-choose-the-backbone)). Weights
-download from Hugging Face on first use. On a machine without internet access
-(Jean Zay compute nodes), download them once on a connected machine that shares
+download from Hugging Face on first use. On a machine without internet access, download them once on a connected machine that shares
 the same `HF_HOME`, then set `HF_HUB_OFFLINE=1` (the Slurm files already do).
 
 | `--vlm_name` | Download | Size |
@@ -84,16 +83,12 @@ the same `HF_HOME`, then set `HF_HUB_OFFLINE=1` (the Slurm files already do).
 `pi0` and `pi05` also need the PaliGemma tokenizer, which is gated: accept its
 license on Hugging Face, log in (`huggingface-cli login`), then run
 `python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('google/paligemma-3b-pt-224')"`.
-The Eagle tokenizer of `gr00t` ships with the repository. On Jean Zay all four
-are already in `$HOME/.cache/huggingface`.
+The Eagle tokenizer of `gr00t` ships with the repository. 
 
 ## Step 2: Check the installation
 
 ```bash
-# 1. Unit and integration tests (CPU). On Jean Zay, use the training interpreter,
-#    cap the threads (otherwise the run takes ~50 min on a login node), skip the
-#    user-site TensorFlow (it breaks the transformers import) and write no caches
-#    (WORK has a file quota):
+# 1. Unit and integration tests (CPU). 
 USE_TF=0 OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONDONTWRITEBYTECODE=1 \
     tmp/train-env/bin/python -m pytest tests -q -p no:cacheprovider --continue-on-collection-errors
 
