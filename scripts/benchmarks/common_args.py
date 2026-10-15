@@ -10,7 +10,11 @@ from adaspevla.utils.training import add_method_arguments
 
 
 def add_training_arguments(parser, default_output):
-    parser.add_argument("--vlm_name", default="google/siglip-base-patch16-224")
+    parser.add_argument(
+        "--vlm_name",
+        default="google/siglip-base-patch16-224",
+        help="A Hugging Face SigLIP model, or the encoder of pi0, pi05 or gr00t",
+    )
     parser.add_argument("--num_control_points", type=int, default=8)
     parser.add_argument("--degree", type=int, default=3)
     parser.add_argument("--chunk_horizon", type=int, default=16, help="Action chunk length")

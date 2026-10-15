@@ -41,7 +41,7 @@ def load_policy(ckpt_path, device="cpu"):
     if ckpt.get("training_stage") != "timing":
         raise ValueError("Evaluation requires a checkpoint trained through stage 2")
     policy = AdaSpeVLAPolicy(**ckpt["model_config"]).to(device)
-    policy.load_state_dict(ckpt["model_state"], strict=True)
+    policy.load_checkpoint_state(ckpt["model_state"])
     policy.eval()
     return policy, ckpt.get("calibration", {}), ckpt
 

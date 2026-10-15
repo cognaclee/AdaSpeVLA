@@ -6,11 +6,18 @@ SigLIP patch token of every view (plus a view embedding), the instruction and,
 when configured, the robot state. Spatial mode preprocesses on the GPU, applies
 random-crop and colour-jitter augmentation while training (centre crop at
 inference) and can fine-tune the last vision blocks.
+
+``model_name`` may also name the observation encoder of a pretrained VLA
+(``pi0``, ``pi05``, ``gr00t``; see :mod:`.vla_backbones`). Its image tokens and
+instruction feature then replace the SigLIP ones; everything after that is the
+same.
 """
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from .vla_backbones import PretrainedVLAEncoder, vla_backbone_key
 
 
 class MultiCameraVLMBackbone(nn.Module):
@@ -26,6 +33,8 @@ class MultiCameraVLMBackbone(nn.Module):
         proprio_dim=0,
         augment=False,
         crop_ratio=0.9,
+        vlm_mode="joint",
+        vlm_dtype="auto",
     ):
         super().__init__()
         if use_lora:
@@ -37,6 +46,10 @@ class MultiCameraVLMBackbone(nn.Module):
         self.spatial_tokens, self.proprio_dim = bool(spatial_tokens), int(proprio_dim)
         self.augment, self.crop_ratio = bool(augment), float(crop_ratio)
         self.trainable_vision_layers = 0
+        # Backbone weights trained at some point; the rest are reloaded from the
+        # pretrained files instead of being saved in checkpoints.
+        self._tuned_keys = set()
+        self.is_vla = False
         if test_mode:
             # Explicit, small trainable test model. Never selected on load failure.
             self.vision_encoder = nn.Sequential(
@@ -48,6 +61,14 @@ class MultiCameraVLMBackbone(nn.Module):
             self.text_encoder = nn.Embedding(257, 32, padding_idx=0)
             self.feature_dim, self.text_feature_dim = 24, 32
             self.processor = None
+        elif vla_backbone_key(model_name) is not None:
+            self.is_vla, self.processor, self.text_encoder = True, None, None
+            self.vision_encoder = PretrainedVLAEncoder(model_name, vlm_mode, vlm_dtype)
+            self.feature_dim = self.text_feature_dim = self.vision_encoder.hidden_size
+            self.image_size = self.vision_encoder.image_size
+            # SigLIP-So400m in pi0 and Eagle maps [0,1] to [-1,1].
+            self.register_buffer("pixel_mean", torch.full((1, 3, 1, 1), 0.5), persistent=False)
+            self.register_buffer("pixel_std", torch.full((1, 3, 1, 1), 0.5), persistent=False)
         else:
             from transformers import AutoModel, AutoProcessor
 
@@ -130,6 +151,8 @@ class MultiCameraVLMBackbone(nn.Module):
         if count:
             if self.test_mode:
                 self.vision_encoder.requires_grad_(True)
+            elif self.is_vla:
+                self.vision_encoder.set_trainable_vision_layers(count)
             else:
                 vision = self.vision_encoder.vision_model
                 for block in vision.encoder.layers[-count:]:
@@ -138,6 +161,28 @@ class MultiCameraVLMBackbone(nn.Module):
                 if getattr(vision, "head", None) is not None:
                     vision.head.requires_grad_(True)
         self.trainable_vision_layers = int(count)
+        self.mark_tuned(
+            name for name, p in self.vision_encoder.named_parameters() if p.requires_grad
+        )
+
+    def mark_tuned(self, names):
+        """Record backbone weights (names inside ``vision_encoder``) as trained."""
+        self._tuned_keys.update(f"vision_encoder.{name}" for name in names)
+
+    def frozen_pretrained_keys(self):
+        """State-dict keys of pretrained backbone weights that were never trained.
+
+        They equal the pretrained files, so checkpoints leave them out and a
+        rebuilt policy keeps the weights it loaded from those files.
+        """
+        if self.test_mode or not self.freeze_backbone:
+            return set()
+        keys = set()
+        for encoder in ("vision_encoder", "text_encoder"):
+            module = getattr(self, encoder)
+            if module is not None:
+                keys.update(f"{encoder}.{key}" for key in module.state_dict())
+        return keys - self._tuned_keys
 
     def _pixels(self, flat):
         """Crop (random while training, centre otherwise), jitter, resize, normalize."""
@@ -179,13 +224,19 @@ class MultiCameraVLMBackbone(nn.Module):
             out = self.vision_encoder.vision_model(pixel_values=pixels)
             return out.last_hidden_state, out.pooler_output
 
-    def encode_images(self, images):
+    def _check_images(self, images):
         if images.ndim == 4:
             images = images.unsqueeze(1)
         if images.ndim != 5 or images.shape[1:3] != (self.num_views, 3):
             raise ValueError("Expected (B, configured_views, 3, H, W) images")
         if not torch.isfinite(images).all() or ((images < 0) | (images > 1)).any():
             raise ValueError("Input RGB images must be floating values in [0,1]")
+        return images
+
+    def encode_images(self, images):
+        if self.is_vla:
+            raise ValueError("VLA backbones encode images and text together; call forward")
+        images = self._check_images(images)
         B = images.shape[0]
         flat = images.reshape(-1, *images.shape[2:])
         if self.spatial_tokens:
@@ -221,7 +272,8 @@ class MultiCameraVLMBackbone(nn.Module):
         """Projected instruction embedding; see :meth:`_text_features`."""
         return self.text_proj(self._text_features(text_prompts, batch_size, device))
 
-    def _text_features(self, text_prompts, batch_size, device):
+    @staticmethod
+    def _prompt_list(text_prompts, batch_size):
         if isinstance(text_prompts, str):
             text_prompts = [text_prompts] * batch_size
         if (
@@ -232,6 +284,12 @@ class MultiCameraVLMBackbone(nn.Module):
             raise ValueError(
                 "Provide one nonempty language instruction per observation"
             )
+        return list(text_prompts)
+
+    def _text_features(self, text_prompts, batch_size, device):
+        if self.is_vla:
+            raise ValueError("VLA backbones encode images and text together; call forward")
+        text_prompts = self._prompt_list(text_prompts, batch_size)
         if self.test_mode:
             tokens = torch.zeros(batch_size, 128, dtype=torch.long, device=device)
             for row, text in enumerate(text_prompts):
@@ -258,6 +316,22 @@ class MultiCameraVLMBackbone(nn.Module):
             raise ValueError("Unexpected text feature shape from configured backbone")
         return features.to(self.text_proj[0].weight.dtype)
 
+    def _encode_vla(self, images, instructions):
+        """Global image feature, token memory (spatial mode) and text feature."""
+        images = self._check_images(images)
+        B, V = images.shape[:2]
+        prompts = self._prompt_list(instructions, B)
+        pixels = self._pixels(images.reshape(-1, *images.shape[2:]))
+        with torch.set_grad_enabled(torch.is_grad_enabled() and self.trainable_vision_layers > 0):
+            tokens, text = self.vision_encoder(pixels, prompts, V)
+        dtype = self.fusion_proj[0].weight.dtype
+        tokens, text = tokens.to(dtype), text.to(dtype)
+        pooled = self.fusion_proj(tokens.mean(2).reshape(B, -1))
+        if not self.spatial_tokens:
+            return pooled, None, text
+        tokens = self.token_proj(tokens) + self.view_embedding
+        return pooled, tokens.flatten(1, 2), text
+
     def forward(self, images, instructions=None, proprio=None, return_memory=False):
         """Global condition (B, output_dim); with ``return_memory`` also the token memory.
 
@@ -266,11 +340,14 @@ class MultiCameraVLMBackbone(nn.Module):
         """
         if self.proprio_dim and (proprio is None or proprio.shape != (images.shape[0], self.proprio_dim)):
             raise ValueError(f"Expected proprio of shape (B, {self.proprio_dim})")
-        if self.spatial_tokens:
-            vision, tokens = self.encode_images(images)
+        if self.is_vla:
+            vision, tokens, text_features = self._encode_vla(images, instructions)
         else:
-            vision, tokens = self.encode_images(images), None
-        text_features = self._text_features(instructions, images.shape[0], images.device)
+            if self.spatial_tokens:
+                vision, tokens = self.encode_images(images)
+            else:
+                vision, tokens = self.encode_images(images), None
+            text_features = self._text_features(instructions, images.shape[0], images.device)
         text = self.text_proj(text_features)
         gate = self.cross_gate(torch.cat((vision, text), dim=-1))
         cond = self.final_proj(gate * vision + (1 - gate) * text)

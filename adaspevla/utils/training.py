@@ -14,6 +14,7 @@ import argparse
 from torch.utils.data import DataLoader
 from ..datasets.bspline_dataset import collate_windows
 from ..models.adaspe_vla_policy import AdaSpeVLAPolicy
+from ..models.vla_backbones import VLA_MODES
 
 # 4: anchor-relative offsets with a continuous gripper-width spline channel.
 CHECKPOINT_FORMAT = 4
@@ -36,8 +37,22 @@ def add_method_arguments(parser):
     parser.add_argument(
         "--augment",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Random crop and colour jitter while training (spatial mode)",
+    )
+    parser.add_argument(
+        "--vlm_mode",
+        choices=VLA_MODES,
+        default="joint",
+        help="pi0/pi05/gr00t backbones: images and instruction through the language "
+        "model together (joint) or the instruction alone (separate)",
+    )
+    parser.add_argument(
+        "--vlm_dtype",
+        choices=["auto", "bfloat16", "float16", "float32"],
+        default="auto",
+        help="pi0/pi05/gr00t language model (frozen); auto = bfloat16 on Ampere or newer, "
+        "else float32. The vision tower stays float32 and runs under autocast",
     )
     parser.add_argument(
         "--vision_finetune_layers",
@@ -178,6 +193,8 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         proprio_std=dataset.calibration["proprio_std"] if use_proprio else None,
         augment=spatial and bool(getattr(args, "augment", False)),
         vision_finetune_layers=finetune_layers,
+        vlm_mode=getattr(args, "vlm_mode", "joint"),
+        vlm_dtype=getattr(args, "vlm_dtype", "auto"),
     ).to(args.device)
     workers = int(getattr(args, "num_workers", 0) or 0)
     loader = DataLoader(
@@ -275,7 +292,7 @@ def train_two_stage(args, dataset, benchmark, action_dim):
                     )
                     running = 0.0
                     checkpoint = dict(
-                        model_state=policy.state_dict(),
+                        model_state=policy.checkpoint_state_dict(),
                         model_config=policy.config,
                         format_version=CHECKPOINT_FORMAT,
                         training_stage=stage,

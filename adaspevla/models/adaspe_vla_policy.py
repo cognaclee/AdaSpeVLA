@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from .vlm_backbone import MultiCameraVLMBackbone
+from .vla_backbones import vla_backbone_key
 from .bspline_flow_policy import BSplineFlowMatchingPolicy
 from ..bspline.bspline_core import BSplineEvaluator
 from ..bspline.learnable_knots import (
@@ -60,6 +61,8 @@ class AdaSpeVLAPolicy(nn.Module):
         proprio_std=None,
         augment=False,
         vision_finetune_layers=0,
+        vlm_mode="joint",
+        vlm_dtype="auto",
     ):
         super().__init__()
         if knot_supervision not in ("kl", "position"):
@@ -156,6 +159,9 @@ class AdaSpeVLAPolicy(nn.Module):
             self.config.update(spatial_tokens=True, augment=bool(augment))
         if self.vision_finetune_layers:
             self.config["vision_finetune_layers"] = self.vision_finetune_layers
+        if vla_backbone_key(vlm_name) is not None and not test_mode:
+            # pi0 / pi0.5 / GR00T encoder: how images and text meet, and its dtype.
+            self.config.update(vlm_mode=vlm_mode, vlm_dtype=vlm_dtype)
         if self.proprio_dim:
             if proprio_mean is None or proprio_std is None:
                 raise ValueError("Robot-state conditioning needs proprio_mean and proprio_std")
@@ -185,6 +191,8 @@ class AdaSpeVLAPolicy(nn.Module):
             spatial_tokens=self.spatial_tokens,
             proprio_dim=self.proprio_dim,
             augment=bool(augment),
+            vlm_mode=vlm_mode,
+            vlm_dtype=vlm_dtype,
         )
         self.knot_head = LearnableKnotPlacementHead(
             cond_dim,
@@ -245,6 +253,29 @@ class AdaSpeVLAPolicy(nn.Module):
             else:
                 self.vlm.trainable_vision_layers = 0
         self.train(self.training)
+
+    def checkpoint_state_dict(self):
+        """State dict without the never-trained pretrained backbone weights."""
+        state = self.state_dict()
+        for key in self.vlm.frozen_pretrained_keys():
+            state.pop(f"vlm.{key}", None)
+        return state
+
+    def load_checkpoint_state(self, state):
+        """Load a full or a :meth:`checkpoint_state_dict` state strictly otherwise.
+
+        Only pretrained backbone weights may be missing; this policy already
+        loaded them from the pretrained files.
+        """
+        allowed = {f"vlm.{key}" for key in self.vlm.frozen_pretrained_keys()}
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        if unexpected or set(missing) - allowed:
+            raise RuntimeError(
+                f"Checkpoint mismatch: missing {sorted(set(missing) - allowed)[:5]}, "
+                f"unexpected {sorted(unexpected)[:5]}"
+            )
+        prefix = "vlm.vision_encoder."
+        self.vlm.mark_tuned(key[len(prefix) :] for key in state if key.startswith(prefix))
 
     def _encode(self, images, instructions, proprio=None):
         """Global condition and (spatial mode) token memory for one observation batch."""

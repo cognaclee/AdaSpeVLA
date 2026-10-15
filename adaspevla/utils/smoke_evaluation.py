@@ -69,7 +69,7 @@ def run_smoke_evaluation(
                 "Checkpoint arm count does not match the requested evaluation"
             )
         policy = AdaSpeVLAPolicy(**config).to(args.device)
-        policy.load_state_dict(ckpt["model_state"], strict=True)
+        policy.load_checkpoint_state(ckpt["model_state"])
         print(f"Checkpoint calibration: {ckpt.get('calibration', {})}")
     else:
         policy = AdaSpeVLAPolicy(

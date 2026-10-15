@@ -119,17 +119,3 @@ a_rot = Rbase.T @ Log(R_j @ R_k.T)
 `j` is `action/right_ee_joint_states` of row `j-1` (row 0 for the first sample):
 the command that is meant to hold once the pose of row `j` is reached. It stays
 continuous; thresholding happens only for binary grippers at execution.
-
-### Timing limitation
-
-The collector stores its save stride in `frequency`, so the nominal sample period
-is `save_freq × simulation_dt`, e.g. `15 × (1/250) = 0.06 s`, **not** `1/15 s`.
-The collector also saves extra frames at segment boundaries, so without per-frame
-timestamps the exact intervals cannot be recovered. The adapter warns about this
-and records its time source in the checkpoint calibration. `--sample_dt` and
-`--robotwin_simulation_dt` change the nominal period but cannot recover irregular
-timing; exact-time experiments need a timestamp-preserving export.
-
-Calibration records the source profile, selected arm, base rotation, gripper
-convention (continuous width) and timing conversion alongside the
-normalization statistics.
