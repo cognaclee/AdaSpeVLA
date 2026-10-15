@@ -102,3 +102,31 @@ def normalized_pose(pose, unit_atol=0.05):
             f"Observed pose quaternion norm {norm:.4f} is not unit; expected wxyz order"
         )
     return np.concatenate((pose[:3], pose[3:] / norm))
+
+
+PROPRIO_PER_ARM = 10
+
+
+def proprio_features(poses, widths, world_from_base):
+    """Robot state per arm: base-frame position, 6-D rotation, gripper width.
+
+    ``poses`` (arms,7) are the anchor poses in the logging frame (the poses used
+    by :func:`anchor_deltas` and :func:`delta_to_target`); ``widths`` (arms,) are
+    the last commanded widths in [0,1]. Position is ``R_b^T p`` and the rotation
+    is the first two columns of ``R_b^T R`` (continuous, no quaternion sign flip).
+    Returns a float32 vector of ``PROPRIO_PER_ARM`` values per arm.
+    """
+    poses = np.asarray(poses, dtype=np.float64).reshape(-1, 7)
+    widths = np.asarray(widths, dtype=np.float64).reshape(-1)
+    if len(poses) != len(widths) or len(poses) != len(world_from_base):
+        raise ValueError("Need one pose, width and base rotation per arm")
+    features = []
+    for pose, width, rotation in zip(poses, widths, world_from_base):
+        to_base = rotation.inv()
+        matrix = (to_base * wxyz_to_rotation(pose[3:])).as_matrix()
+        features.append(
+            np.concatenate(
+                (to_base.apply(pose[:3]), matrix[:, 0], matrix[:, 1], [np.clip(width, 0, 1)])
+            )
+        )
+    return np.concatenate(features).astype(np.float32)

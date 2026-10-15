@@ -10,6 +10,7 @@ from .action_contract import (
     validate_motion_scales,
     window_offsets,
 )
+from ..benchmarks.pose_math import PROPRIO_PER_ARM, proprio_features
 from ..bspline.curve_fitting import fit_bspline_control_points_grouped
 from ..bspline.learnable_knots import (
     compute_curvature_density_target,
@@ -203,6 +204,10 @@ class UniversalBSplineDataset(Dataset):
                             criticality[start:stop],
                             instruction,
                             label,
+                            # Robot state at the anchor; widths[start] is the last command.
+                            proprio_features(
+                                poses[start], widths[start], world_from_base
+                            ),
                         )
                     )
         if not windows:
@@ -231,6 +236,12 @@ class UniversalBSplineDataset(Dataset):
             )
             e_crit = max(float(np.quantile(variation, event_quantile)), 1e-6)
         self.e_crit = float(e_crit)
+        # Standardize positions only; 6-D rotations and widths are already O(1).
+        proprio = np.stack([w[6] for w in windows]).reshape(-1, self.num_arms, PROPRIO_PER_ARM)
+        proprio_mean = np.zeros((self.num_arms, PROPRIO_PER_ARM))
+        proprio_std = np.ones((self.num_arms, PROPRIO_PER_ARM))
+        proprio_mean[:, :3] = proprio[..., :3].mean(0)
+        proprio_std[:, :3] = np.maximum(proprio[..., :3].std(0), 1e-3)
         if not 0 < self.e_crit < float("inf"):
             raise ValueError("e_crit must be finite and positive")
         self.calibration = dict(
@@ -251,6 +262,8 @@ class UniversalBSplineDataset(Dataset):
             channel_order="per arm: six anchor-relative offsets, then gripper width",
             gripper_density_gain=self.gripper_density_gain,
             gripper_threshold=self.gripper_threshold,
+            proprio_mean=proprio_mean.reshape(-1).tolist(),
+            proprio_std=proprio_std.reshape(-1).tolist(),
         )
         if self.per_arm_knots:
             self.calibration["per_arm_knots"] = True
@@ -268,7 +281,7 @@ class UniversalBSplineDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        image, raw, times, criticality, instruction, label = self.samples[index]
+        image, raw, times, criticality, instruction, label, proprio = self.samples[index]
         image = torch.as_tensor(np.array(image, copy=True))
         if image.ndim == 3:
             image = image.unsqueeze(0)
@@ -357,6 +370,7 @@ class UniversalBSplineDataset(Dataset):
             "horizon_duration": horizon.float(),
             "target_query_interval": target_interval.float(),
             "instructions": instruction,
+            "proprio": torch.from_numpy(proprio),
             "timing_target_source": "measured" if label is not None else "heuristic",
         }
         if self.include_diagnostic_targets:

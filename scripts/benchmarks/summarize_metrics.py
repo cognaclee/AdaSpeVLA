@@ -31,7 +31,7 @@ COLUMNS = [
 
 def load_records(path):
     path = Path(path)
-    files = sorted(path.glob("*.jsonl")) if path.is_dir() else [path]
+    files = sorted(path.rglob("*.jsonl")) if path.is_dir() else [path]
     records = []
     for file in files:
         with file.open() as handle:

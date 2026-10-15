@@ -14,6 +14,7 @@ RoboCasa365, and the XPolicyLab adapter) are in
 
 | I want to... | Go to |
 |---|---|
+| Train and evaluate on the RoboTwin / RoboCasa suite on Jean Zay (Slurm) | [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
 | Install AdaSpeVLA and check it works | [Step 1](#step-1-install) and [Step 2](#step-2-check-the-installation) below |
 | Train on a native RoboTwin HDF5 export (right arm) | [Step 3](#step-3-train-on-native-robotwin-hdf5-right-arm) and [docs/robotwin_native.md](docs/robotwin_native.md) |
 | Train on HDF5 data I already converted | [Step 4](#step-4-train-on-already-converted-hdf5-data) |
@@ -24,6 +25,24 @@ RoboCasa365, and the XPolicyLab adapter) are in
 | Split raw RoboTwin / RoboCasa demos into difficulty-adaptive spline segments | [Segment demonstrations into adaptive action chunks](#segment-demonstrations-into-adaptive-action-chunks) and [result.md](result.md) |
 
 All commands run from the repository root unless a step says otherwise.
+
+On Jean Zay, training and evaluation run as self-contained `.slurm` files
+(`run.slurm`, `pilot_train*.slurm`, `eval.slurm`, `eval_robotwin.slurm`, ...),
+submitted with a plain `sbatch <file>.slurm`. The full workflow, the hardware
+and memory settings, and how to read the results are in
+[docs/slurm_benchmarks.md](docs/slurm_benchmarks.md).
+
+The short version, from the repository root:
+
+```bash
+# 1. Train: copy a training file, set its #SBATCH --array (task rows), RUN_ROOT and flags
+cp pilot_train_noaug.slurm my_train.slurm && sbatch my_train.slurm
+# 2. Evaluate in simulation: copy eval.slurm (RoboCasa) or eval_robotwin.slurm (RoboTwin),
+#    point RUN_ROOT/METRICS_ROOT at the run, add #SBATCH --dependency=afterok:<train job>_<row>
+sbatch my_eval_robotwin.slurm
+# 3. Summarize success rate, queries and timing per mode
+python -m scripts.benchmarks.summarize_metrics eval_metrics/<run>-robotwin/robotwin/<task>/demo_clean
+```
 
 ---
 
@@ -41,7 +60,7 @@ conda activate adaspevla
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # 3. Install AdaSpeVLA (editable) with the test tools
-cd /home/lzezeng/codes/AdaSpeVLA
+cd /path/to/AdaSpeVLA
 pip install -e ".[dev]"
 ```
 
@@ -58,17 +77,30 @@ export HF_HUB_OFFLINE=1
 ## Step 2: Check the installation
 
 ```bash
-# 1. Unit and integration tests (CPU, under a minute; expect "119 passed")
-python -m pytest tests -q
+# 1. Unit and integration tests (CPU). On Jean Zay, run with the training
+#    interpreter and without writing caches (WORK has a file quota):
+PYTHONDONTWRITEBYTECODE=1 tmp/train-env/bin/python -m pytest tests -q -p no:cacheprovider
 
 # 2. End-to-end smoke run: synthetic data, tiny offline backbone, CPU
-python -m scripts.train_robotwin --synthetic_data --test_backbone \
+python -m scripts.train_robotwin --synthetic_data --test_backbone --no-proprio \
     --epochs 1 --timing_epochs 1 --num_ode_steps 2 --batch_size 2 \
     --device cpu --output_dir /tmp/adaspevla-smoke
 python -m scripts.eval_robotwin \
     --ckpt_path /tmp/adaspevla-smoke/adaspevla_robotwin_beat_block_hammer_latest.pt \
     --num_episodes 1 --duration 0.2 --device cpu
 ```
+
+The smoke run uses `--no-proprio` because the smoke evaluator
+`scripts.eval_robotwin` doesn't supply robot state yet. With robot state on, they stop with "This policy
+conditions on robot state; pass proprio". The simulator evaluators do supply it.
+
+Test status (Oct 15, 2026): the suite is not green. Two files,
+`tests/benchmarks/test_xpolicylab_benchmarks.py` and
+`tests/benchmarks/test_per_arm_knots.py`, fail to import
+(`integrate_twist` no longer exists in `adaspevla/benchmarks/pose_math.py`),
+and the last full run recorded 26 failures that predate the observation changes
+(see `analysis_low_success.md`). The full suite takes more than 25 minutes on a
+login node. Run single files with `pytest tests/<file>.py` while you work.
 
 `scripts.eval_robotwin` and `scripts.eval_robocasa` are smoke evaluators. They
 run the spline executor without a simulator, so they check that a checkpoint
@@ -90,7 +122,7 @@ ls /path/to/robotwin/source_domain/beat_block_hammer | head
 # 2. Optional: list the dataset paths of one episode
 python -m scripts.inspect_hdf5 /path/to/robotwin/source_domain/beat_block_hammer/<episode>.hdf5
 
-# 3. Train both stages (stage 1: actions, stage 2: query timing)
+# 3. Train all stages (action, SigLIP finetune, query timing)
 python -m scripts.train_robotwin \
     --data_dir /path/to/robotwin/source_domain \
     --task_name beat_block_hammer \
@@ -105,7 +137,8 @@ python -m scripts.eval_robotwin \
 ```
 
 The output is `./checkpoints/robotwin_right/adaspevla_robotwin_<task>_latest.pt`,
-the stage-2 checkpoint that evaluation needs, plus one file per stage.
+the timing-stage checkpoint that evaluation needs, plus one file per stage
+(`_action.pt`, `_finetune.pt`, `_timing.pt`).
 
 Options for this mode:
 
@@ -223,8 +256,17 @@ per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--epochs` | 10 | Stage-1 epochs (action predictor) |
-| `--timing_epochs` | 10 | Stage-2 epochs (query-timing head) |
+| `--epochs` | 10 | `action` stage epochs (action predictor, SigLIP frozen) |
+| `--finetune_epochs` | 5 | `finetune` stage epochs (action loss, last SigLIP blocks trainable) |
+| `--timing_epochs` | 10 | `timing` stage epochs (query-timing head) |
+| `--action_steps`, `--finetune_steps`, `--timing_steps` | off | Optimizer steps per stage; each overrides the matching epoch count |
+| `--warmup_steps` | 500 | Linear warmup (at most 10% of a stage), then cosine decay |
+| `--spatial_tokens` / `--no-spatial_tokens` | on | Condition the flow on all SigLIP patch tokens of every view through cross-attention; off = one pooled feature vector |
+| `--proprio` / `--no-proprio` | on | Condition on robot state: base-frame end-effector position, 6-D rotation and last gripper command, per arm |
+| `--augment` / `--no-augment` | on | Random 90% crop and ±20% colour jitter while training (spatial mode); evaluation uses a centre crop |
+| `--vision_finetune_layers` | 4 | SigLIP vision blocks trained in the `finetune` stage; 0 skips the stage (needs spatial mode) |
+| `--vision_lr_scale` | 0.1 | Learning-rate multiplier for those SigLIP blocks |
+| `--num_workers` | 8 | DataLoader workers |
 | `--batch_size`, `--lr` | 8, 2e-4 | Optimizer settings |
 | `--num_control_points`, `--degree` | 8, 3 | B-spline size |
 | `--chunk_horizon` | 16 | Window length in samples, when `--supported_horizons` is not set |
@@ -241,6 +283,11 @@ per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
 | `--vlm_name` | `google/siglip-base-patch16-224` | Backbone |
 | `--device` | `cuda` if available | Training device |
 | `--test_backbone` | off | Tiny offline backbone, for tests only |
+
+The observation options (`--spatial_tokens`, `--proprio`, `--augment`,
+`--vision_finetune_layers`) default to on, so a plain training command trains
+the full model. To reproduce the earlier pooled-feature model, pass
+`--no-spatial_tokens --no-proprio --no-augment --vision_finetune_layers 0`.
 
 ---
 
@@ -265,17 +312,25 @@ per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
 3. Knot span targets use a density with a motion term (normalized second finite
    difference of the offsets) and a separate gripper term `beta_g` on the width
    change rate, plus optional criticality.
-4. Stage 1 trains the action predictor with flow matching over all channels
-   (motion and width) and knot span KL; there is no separate gripper loss.
-   Control-point targets are refitted on the predicted knots and detached. The
-   first control point's motion is zero in targets and in generated samples.
-   The timing head is not updated in this stage.
-5. Stage 2 freezes the whole action predictor (including the backbone), generates
+4. The `action` stage trains the action predictor with flow matching over all
+   channels (motion and width) and knot span KL; there is no separate gripper
+   loss. Control-point targets are refitted on the predicted knots and detached.
+   The first control point's motion is zero in targets and in generated samples.
+   SigLIP is frozen and the timing head is not updated in this stage. With
+   `--spatial_tokens`, every policy block cross-attends to a token memory: the
+   projected patch tokens of every view plus a per-view embedding, one pooled
+   instruction token and, with `--proprio`, one robot-state token. The robot
+   state is normalized with statistics saved in the calibration.
+5. The optional `finetune` stage keeps the action loss and also trains the last
+   `--vision_finetune_layers` SigLIP vision blocks (plus its final layer norm
+   and head) at `lr × --vision_lr_scale`. The text tower stays frozen. Every
+   stage has its own AdamW, warmup + cosine schedule and gradient clipping at 1.0.
+6. The `timing` stage freezes the whole action predictor (including the backbone), generates
    control points using the inference flow solver, and trains only
    `policy.freq_head`. Inputs are context, log horizon, detached spans, and
    probes of the planned motion and clamped width. The loss is log-MSE on query
    intervals.
-6. Measured valid intervals override the fallback teacher. Fallback events at
+7. Measured valid intervals override the fallback teacher. Fallback events at
    sample indices `j >= 1` are acceleration magnitude `e_{j-1} >= e_crit`, any
    arm's width crossing `theta_g = 0.5`, or criticality `>= 0.5`. The target is
    the first event time minus a nonnegative anticipation margin, clipped to the
@@ -335,9 +390,13 @@ resizing/normalization and text tokenization. Model-loading failures propagate;
 the offline test backbone is selected only by `--test_backbone`.
 
 Training saves `format_version=4`, `model_config`, `model_state`,
-`training_stage` and `calibration`. Evaluation requires a stage-2 checkpoint
-(`*_latest.pt`) and loads weights strictly. **Checkpoints from older versions
-must be retrained.**
+`training_stage`, `step` and `calibration`, once per epoch or at least every
+2000 steps, as `adaspevla_<benchmark>_<task>_<stage>.pt` (`action`,
+`finetune`, `timing`). `*_latest.pt` is written only when the timing stage
+ends, and it is the file evaluation needs; weights load strictly. Checkpoints
+trained before the observation options existed have none of their config keys
+and load as the pooled-feature model. Checkpoints older than format 4 must be
+retrained.
 
 ### Using the policy in your own control loop
 

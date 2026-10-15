@@ -29,7 +29,13 @@ class FlowMatchingTransformerBlock(nn.Module):
     Transformer block with adaptive LayerNorm (AdaLN) modulation.
     """
 
-    def __init__(self, hidden_dim: int, num_heads: int = 8, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        cross_attention: bool = False,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.attn = nn.MultiheadAttention(
@@ -42,13 +48,22 @@ class FlowMatchingTransformerBlock(nn.Module):
             nn.GELU(),
             nn.Linear(mlp_hidden_dim, hidden_dim),
         )
+        # Optional cross-attention from control-point tokens to observation tokens.
+        self.cross_attention = cross_attention
+        if cross_attention:
+            self.norm_cross = nn.LayerNorm(hidden_dim)
+            self.cross_attn = nn.MultiheadAttention(
+                hidden_dim, num_heads=num_heads, batch_first=True
+            )
         # AdaLN modulation scale and shift parameters
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_dim, 6 * hidden_dim)
         )
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        # x: (B, K, hidden_dim), c: (B, hidden_dim)
+    def forward(
+        self, x: torch.Tensor, c: torch.Tensor, memory: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # x: (B, K, hidden_dim), c: (B, hidden_dim), memory: (B, M, hidden_dim)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
@@ -57,6 +72,14 @@ class FlowMatchingTransformerBlock(nn.Module):
         norm_x = self.norm1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         attn_out, _ = self.attn(norm_x, norm_x, norm_x, need_weights=False)
         x = x + gate_msa.unsqueeze(1) * attn_out
+
+        if self.cross_attention:
+            if memory is None:
+                raise ValueError("This flow block requires an observation token memory")
+            cross_out, _ = self.cross_attn(
+                self.norm_cross(x), memory, memory, need_weights=False
+            )
+            x = x + cross_out
 
         # MLP with modulated LayerNorm
         norm_x2 = self.norm2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
@@ -79,8 +102,10 @@ class BSplineFlowMatchingPolicy(nn.Module):
         hidden_dim: int = 384,
         num_layers: int = 6,
         num_heads: int = 6,
+        memory_dim: Optional[int] = None,
     ):
         super().__init__()
+        self.memory_dim = memory_dim
         self.num_control_points = num_control_points
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
@@ -107,16 +132,28 @@ class BSplineFlowMatchingPolicy(nn.Module):
         # Transformer Backbone
         self.blocks = nn.ModuleList(
             [
-                FlowMatchingTransformerBlock(hidden_dim=hidden_dim, num_heads=num_heads)
+                FlowMatchingTransformerBlock(
+                    hidden_dim=hidden_dim,
+                    num_heads=num_heads,
+                    cross_attention=memory_dim is not None,
+                )
                 for _ in range(num_layers)
             ]
         )
+        if memory_dim is not None:
+            self.memory_proj = nn.Sequential(
+                nn.LayerNorm(memory_dim), nn.Linear(memory_dim, hidden_dim)
+            )
 
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, action_dim)
 
     def forward_velocity(
-        self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor,
+        memory: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Evaluates the vector field v_theta(x_t, t, cond).
@@ -124,6 +161,7 @@ class BSplineFlowMatchingPolicy(nn.Module):
             x_t: (B, K, d_a) Noisy control points at continuous time t in [0, 1].
             t: (B,) Generative flow time, distinct from physical trajectory time.
             cond: (B, cond_dim) Multimodal condition embedding.
+            memory: (B, M, memory_dim) observation tokens, required with memory_dim.
         Returns:
             v_pred: (B, K, d_a) Predicted velocity field.
         """
@@ -137,16 +175,24 @@ class BSplineFlowMatchingPolicy(nn.Module):
         # Project control points to tokens
         h = self.input_proj(x_t) + self.pos_emb  # (B, K, hidden_dim)
 
+        if self.memory_dim is not None:
+            if memory is None:
+                raise ValueError("This flow policy requires an observation token memory")
+            memory = self.memory_proj(memory)
+
         # Pass through Transformer blocks
         for block in self.blocks:
-            h = block(h, global_cond)
+            h = block(h, global_cond, memory)
 
         h = self.final_norm(h)
         v_pred = self.output_proj(h)  # (B, K, d_a)
         return v_pred
 
     def compute_loss(
-        self, target_control_points: torch.Tensor, cond: torch.Tensor
+        self,
+        target_control_points: torch.Tensor,
+        cond: torch.Tensor,
+        memory: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Computes the Conditional Flow Matching (CFM) loss.
@@ -169,7 +215,7 @@ class BSplineFlowMatchingPolicy(nn.Module):
         target_velocity = x_1 - x_0
 
         # Predict velocity field
-        pred_velocity = self.forward_velocity(x_t, t, cond)
+        pred_velocity = self.forward_velocity(x_t, t, cond, memory)
 
         # Flow matching MSE loss
         loss = F.mse_loss(pred_velocity, target_velocity)
@@ -177,7 +223,12 @@ class BSplineFlowMatchingPolicy(nn.Module):
         return loss, {"flow_loss": loss.item()}
 
     @torch.no_grad()
-    def sample(self, cond: torch.Tensor, num_steps: int = 15) -> torch.Tensor:
+    def sample(
+        self,
+        cond: torch.Tensor,
+        num_steps: int = 15,
+        memory: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Euler ODE solver; achieved inference speed must be measured.
         Integrates dx/dt = v_theta(x, t, cond) from t=0 to t=1.
@@ -194,7 +245,7 @@ class BSplineFlowMatchingPolicy(nn.Module):
         for step in range(num_steps):
             t_val = step * dt
             t = torch.full((B,), t_val, device=device, dtype=torch.float32)
-            v = self.forward_velocity(x, t, cond)
+            v = self.forward_velocity(x, t, cond, memory)
             x = x + dt * v
 
         return x

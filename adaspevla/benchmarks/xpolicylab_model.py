@@ -23,7 +23,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .pose_math import base_rotation, delta_to_target, normalized_pose, pose_error
+from .pose_math import (
+    base_rotation,
+    delta_to_target,
+    normalized_pose,
+    pose_error,
+    proprio_features,
+)
 from .rollout import EpisodeRecorder, PrefixPlanner, append_jsonl, load_policy
 from .xpolicylab_data import ARM_PREFIX
 
@@ -100,6 +106,7 @@ class _EnvState:
         self.obs = None
         self.pending = []
         self.instruction = None
+        self.last_widths = None
 
     def reset(self):
         self.planner.reset()
@@ -107,6 +114,7 @@ class _EnvState:
         self.obs = None
         self.pending = []
         self.instruction = None
+        self.last_widths = None
 
 
 class Model(ModelTemplate):
@@ -257,9 +265,15 @@ class Model(ModelTemplate):
         if not instruction:
             instruction = self.case.get("instruction") or str(self.cfg.get("task_name"))
         env.instruction = instruction
-        return env.planner.plan(
-            {"images": self._images(obs), "instructions": [instruction]}
-        )
+        query = {"images": self._images(obs), "instructions": [instruction]}
+        if getattr(self.policy, "proprio_dim", 0):
+            # Training state: the anchor pose and the previous commanded width (1 open).
+            if env.last_widths is None:
+                env.last_widths = np.ones(len(self.arms))
+            poses = np.stack([self._pose(obs, ARM_PREFIX[a]) for a in self.arms])
+            state = proprio_features(poses, env.last_widths, self.world_from_base)
+            query["proprio"] = torch.from_numpy(state)[None].to(self.device)
+        return env.planner.plan(query)
 
     def _commands(self, env, actions, info):
         """Map prefix offsets to absolute pose targets from the query-time anchor."""
@@ -295,6 +309,9 @@ class Model(ModelTemplate):
                 pending[prefix] = targets[i]
                 command[f"{prefix}ee_pose"] = targets[i].astype(np.float32)
                 command[f"{prefix}ee_joint_state"] = np.array([width], dtype=np.float32)
+            env.last_widths = np.array(
+                [float(command[f"{p}ee_joint_state"][0]) for p in prefixes]
+            )
             for prefix, grip in holds.items():  # Unused arms hold their pose.
                 command[f"{prefix}ee_pose"] = anchors[prefix].astype(np.float32)
                 command[f"{prefix}ee_joint_state"] = grip

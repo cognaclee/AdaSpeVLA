@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .pose_math import delta_to_target, pose_error, wxyz_to_rotation
+from .pose_math import delta_to_target, pose_error, proprio_features, wxyz_to_rotation
 from .rollout import EpisodeRecorder, PrefixPlanner
 from scipy.spatial.transform import Rotation
 
@@ -279,6 +279,7 @@ class RoboCasaClosedLoop:
             query_mode=query_mode, fixed_query_interval=fixed_query_interval,
         )
         self.recorder = EpisodeRecorder(self.control_dt, 1)
+        self.use_proprio = bool(getattr(policy, "proprio_dim", 0))
 
     def _images(self, obs):
         frames = [np.array(obs[f"video.{c}"], dtype=np.uint8, copy=True) for c in self.cameras]
@@ -290,11 +291,15 @@ class RoboCasaClosedLoop:
         self.planner.reset()
         self.recorder.reset()
         success, steps = False, 0
+        # Training state uses the previous binary command (1 open); episodes start open.
+        last_width = 1.0
         instruction = str(obs.get("annotation.human.task_description", ""))
         while steps < max_steps and not success:
-            actions, info = self.planner.plan(
-                {"images": self._images(obs), "instructions": [instruction]}
-            )
+            query = {"images": self._images(obs), "instructions": [instruction]}
+            if self.use_proprio:
+                state = proprio_features(observed_pose(obs)[None], [last_width], [IDENTITY])
+                query["proprio"] = self.torch.from_numpy(state)[None].to(self.device)
+            actions, info = self.planner.plan(query)
             # Eq. delta_to_target from the pose observed with this query.
             targets = delta_to_target(observed_pose(obs), actions[:, :6], IDENTITY)
             self.recorder.add_prefix(actions, info, targets[:, None])
@@ -302,10 +307,11 @@ class RoboCasaClosedLoop:
                 position, rotation = osc_delta_command(
                     target, observed_pose(obs), self.position_scale, self.rotation_scale
                 )
+                last_width = 1.0 if action[6] >= 0.5 else 0.0
                 obs, _, done, truncated, step_info = env.step({
                     "action.end_effector_position": position,
                     "action.end_effector_rotation": rotation,
-                    "action.gripper_close": np.array([0.0 if action[6] >= 0.5 else 1.0]),
+                    "action.gripper_close": np.array([1.0 - last_width]),
                     "action.base_motion": np.zeros(4),
                     "action.control_mode": np.array([0.0]),
                 })

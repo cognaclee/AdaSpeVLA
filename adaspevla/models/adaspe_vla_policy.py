@@ -54,6 +54,12 @@ class AdaSpeVLAPolicy(nn.Module):
         flow_loss_coeff=1.0,
         knot_supervision="kl",
         uniform_knots=False,
+        spatial_tokens=False,
+        proprio_dim=0,
+        proprio_mean=None,
+        proprio_std=None,
+        augment=False,
+        vision_finetune_layers=0,
     ):
         super().__init__()
         if knot_supervision not in ("kl", "position"):
@@ -140,6 +146,30 @@ class AdaSpeVLAPolicy(nn.Module):
             self.config["knot_supervision"] = self.knot_supervision
         if self.uniform_knots:
             self.config["uniform_knots"] = True
+        # Observation upgrades (patch-token memory, robot state, vision fine-tuning).
+        if vision_finetune_layers and not spatial_tokens:
+            raise ValueError("vision_finetune_layers requires spatial_tokens")
+        self.spatial_tokens = bool(spatial_tokens)
+        self.proprio_dim = int(proprio_dim)
+        self.vision_finetune_layers = int(vision_finetune_layers)
+        if self.spatial_tokens:
+            self.config.update(spatial_tokens=True, augment=bool(augment))
+        if self.vision_finetune_layers:
+            self.config["vision_finetune_layers"] = self.vision_finetune_layers
+        if self.proprio_dim:
+            if proprio_mean is None or proprio_std is None:
+                raise ValueError("Robot-state conditioning needs proprio_mean and proprio_std")
+            mean = torch.as_tensor(proprio_mean, dtype=torch.float32)
+            std = torch.as_tensor(proprio_std, dtype=torch.float32)
+            if mean.shape != (self.proprio_dim,) or std.shape != mean.shape or (std <= 0).any():
+                raise ValueError("proprio_mean/std must be positive-std vectors of proprio_dim")
+            self.register_buffer("proprio_mean", mean)
+            self.register_buffer("proprio_std", std)
+            self.config.update(
+                proprio_dim=self.proprio_dim,
+                proprio_mean=mean.tolist(),
+                proprio_std=std.tolist(),
+            )
         self.register_buffer(
             "motion_scale", validate_motion_scales(motion_scale_values, self.num_arms)
         )
@@ -147,7 +177,14 @@ class AdaSpeVLAPolicy(nn.Module):
             "motion_mask", motion_channel_mask(action_dim), persistent=False
         )
         self.vlm = MultiCameraVLMBackbone(
-            vlm_name, cond_dim, num_views, freeze_vlm, test_mode=test_mode
+            vlm_name,
+            cond_dim,
+            num_views,
+            freeze_vlm,
+            test_mode=test_mode,
+            spatial_tokens=self.spatial_tokens,
+            proprio_dim=self.proprio_dim,
+            augment=bool(augment),
         )
         self.knot_head = LearnableKnotPlacementHead(
             cond_dim,
@@ -167,6 +204,7 @@ class AdaSpeVLAPolicy(nn.Module):
             hidden_dim=flow_hidden_dim,
             num_layers=flow_num_layers,
             num_heads=flow_num_heads,
+            memory_dim=cond_dim if self.spatial_tokens else None,
         )
         self.spline_evaluator = BSplineEvaluator(degree, num_control_points)
         # Features: c, log H, spans, and R probes of every motion and width channel.
@@ -183,8 +221,12 @@ class AdaSpeVLAPolicy(nn.Module):
         self.set_training_stage("action")
 
     def set_training_stage(self, stage):
-        if stage not in ("action", "timing"):
-            raise ValueError("Training stage must be action or timing")
+        """``action`` (frozen vision), ``finetune`` (action loss, last vision blocks
+        trainable) or ``timing`` (query-interval head only)."""
+        if stage not in ("action", "finetune", "timing"):
+            raise ValueError("Training stage must be action, finetune or timing")
+        if stage == "finetune" and not self.vision_finetune_layers:
+            raise ValueError("The finetune stage needs vision_finetune_layers > 0")
         self.zero_grad(set_to_none=True)
         self.training_stage = stage
         for name, parameter in self.named_parameters():
@@ -193,12 +235,25 @@ class AdaSpeVLAPolicy(nn.Module):
                 if stage == "timing"
                 else not name.startswith("freq_head.")
             )
-        if stage == "action" and self.config["freeze_vlm"]:
+        if stage != "timing" and self.config["freeze_vlm"]:
             # Preserve the backbone's own freeze policy; projection remains trainable.
             for name, parameter in self.vlm.named_parameters():
                 if name.startswith(("vision_encoder.", "text_encoder.")):
                     parameter.requires_grad_(False)
+            if stage == "finetune":
+                self.vlm.set_trainable_vision_layers(self.vision_finetune_layers)
+            else:
+                self.vlm.trainable_vision_layers = 0
         self.train(self.training)
+
+    def _encode(self, images, instructions, proprio=None):
+        """Global condition and (spatial mode) token memory for one observation batch."""
+        if self.proprio_dim:
+            if proprio is None:
+                raise ValueError("This policy conditions on robot state; pass proprio")
+            proprio = torch.as_tensor(proprio, device=images.device, dtype=torch.float32)
+            proprio = (proprio.reshape(images.shape[0], -1) - self.proprio_mean) / self.proprio_std
+        return self.vlm(images, instructions=instructions, proprio=proprio, return_memory=True)
 
     def train(self, mode=True):
         super().train(mode)
@@ -207,9 +262,9 @@ class AdaSpeVLAPolicy(nn.Module):
                 module.eval()
         return self
 
-    def _sample_control_points(self, context, num_steps):
+    def _sample_control_points(self, context, num_steps, memory=None):
         """Euler-integrate the flow; P_0 motion is fixed to zero, then restore units."""
-        normalized = self.flow_policy.sample(context, num_steps=num_steps)
+        normalized = self.flow_policy.sample(context, num_steps=num_steps, memory=memory)
         normalized[:, 0, self.motion_mask] = 0
         return denormalize_actions(normalized, self.motion_scale)
 
@@ -243,12 +298,14 @@ class AdaSpeVLAPolicy(nn.Module):
     def forward_timing_loss(self, batch):
         # No fitting and no future demonstrated motion enters this stage.
         with torch.no_grad():
-            cond = self.vlm(batch["images"], instructions=batch["instructions"])
+            cond, memory = self._encode(
+                batch["images"], batch["instructions"], batch.get("proprio")
+            )
             horizon = duration_tensor(batch["horizon_duration"], cond)
             knots, delta = self._predict_knots(cond, horizon)
             context = self._context(cond, knots, horizon)
             physical_cp = self._sample_control_points(
-                context, self.timing_num_ode_steps
+                context, self.timing_num_ode_steps, memory
             )
         interval = self._timing_interval(cond, delta, knots, horizon, physical_cp)
         target = batch["target_query_interval"].reshape(-1, 1)
@@ -331,7 +388,9 @@ class AdaSpeVLAPolicy(nn.Module):
         """Fit labels on current predicted knots; train flow (motion+width) and spans."""
         if self.training_stage == "timing":
             return self.forward_timing_loss(batch)
-        cond = self.vlm(batch["images"], instructions=batch["instructions"])
+        cond, memory = self._encode(
+            batch["images"], batch["instructions"], batch.get("proprio")
+        )
         horizon = duration_tensor(batch["horizon_duration"], cond)
         knots, delta = self._predict_knots(cond, horizon)
         # Fit each timestamped window at its actual length; never pad the fit.
@@ -353,7 +412,9 @@ class AdaSpeVLAPolicy(nn.Module):
                 errors.append(error)
             target_cp, recon = torch.cat(targets), torch.cat(errors)
         context = self._context(cond, knots, horizon)
-        flow_loss, _ = self.flow_policy.compute_loss(target_cp, context)
+        # Legacy policies have no token memory; keep their two-argument call.
+        extra = () if memory is None else (memory,)
+        flow_loss, _ = self.flow_policy.compute_loss(target_cp, context, *extra)
         # Span targets are required for the knot term of the action loss.
         target_delta = batch.get("target_delta")
         if (
@@ -391,6 +452,7 @@ class AdaSpeVLAPolicy(nn.Module):
         horizon_duration=None,
         boundary_value=None,
         num_ode_steps=None,
+        proprio=None,
     ):
         """Return physical control points of anchor-relative offsets and widths.
 
@@ -399,10 +461,11 @@ class AdaSpeVLAPolicy(nn.Module):
         are not clamped here (execution clamps to [0,1]). The optional boundary
         value (B, arms) is the last emitted clamped width (Eq. boundary); it
         replaces the width entry of control point zero only. The caller chooses a
-        trained horizon.
+        trained horizon. ``proprio`` (B, 10*arms) is the raw robot state from
+        ``pose_math.proprio_features``, required when the policy was trained with it.
         """
         self.eval()
-        cond = self.vlm(images, instructions=instructions)
+        cond, memory = self._encode(images, instructions, proprio)
         horizon = duration_tensor(
             self.horizon_duration if horizon_duration is None else horizon_duration,
             cond,
@@ -415,7 +478,7 @@ class AdaSpeVLAPolicy(nn.Module):
             num_ode_steps = self.timing_num_ode_steps
         knots, delta = self._predict_knots(cond, horizon)
         context = self._context(cond, knots, horizon)
-        cp = self._sample_control_points(context, num_ode_steps)
+        cp = self._sample_control_points(context, num_ode_steps, memory)
         if boundary_value is not None:
             cp = BoundaryRefitter.refit_boundary_control_points(
                 cp,
