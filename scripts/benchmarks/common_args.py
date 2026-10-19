@@ -12,7 +12,7 @@ from adaspevla.utils.training import add_method_arguments
 def add_training_arguments(parser, default_output):
     parser.add_argument(
         "--vlm_name",
-        default="google/siglip-base-patch16-224",
+        default="pi05",
         help="A Hugging Face SigLIP model, or the encoder of pi0, pi05 or gr00t",
     )
     parser.add_argument("--num_control_points", type=int, default=8)

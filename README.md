@@ -17,8 +17,9 @@ All commands run from the repository root unless a step says otherwise.
 | Train on a native RoboTwin HDF5 export (right arm) | [Step 3](#step-3-train-on-native-robotwin-hdf5-right-arm), [docs/robotwin_native.md](docs/robotwin_native.md) |
 | Train on HDF5 data I already converted | [Step 4](#step-4-train-on-already-converted-hdf5-data) |
 | Use the vision-language encoder of pi0, pi0.5 or GR00T instead of SigLIP | [Step 5](#step-5-choose-the-backbone) |
+| Reproduce the benchmark training recipe, see why it is set that way and what is being tested | [training_recipe.md](training_recipe.md) |
 | Look up a training option | [Training options](#training-options-all-training-scripts) |
-| Train and evaluate the RoboTwin / RoboCasa suite with Slurm | [Quick start on cluster](#quick-start-on-cluster), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
+| Train and evaluate the RoboTwin / RoboCasa suite on Jean Zay (Slurm) | [Quick start on Jean Zay](#quick-start-on-jean-zay), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
 | Train and evaluate on RoboTwin 2.0 through XPolicyLab | [docs/benchmarks.md, Part A](docs/benchmarks.md#part-a-robotwin-20-through-the-xpolicylab-adapter) |
 | Train and evaluate on RoboDojo | [docs/benchmarks.md, Part B](docs/benchmarks.md#part-b-robodojo-through-the-same-adapter) |
 | Train and evaluate on RoboCasa365 | [docs/benchmarks.md, Part C](docs/benchmarks.md#part-c-robocasa365) |
@@ -26,7 +27,7 @@ All commands run from the repository root unless a step says otherwise.
 | Split demos into difficulty-adaptive spline segments | [Segment demonstrations](#segment-demonstrations-into-adaptive-action-chunks), [result.md](result.md) |
 | Run the policy on my own robot | [Using the policy in your own control loop](#using-the-policy-in-your-own-control-loop) |
 
-## Quick start on cluster
+## Quick start on Jean Zay
 
 Training and evaluation run as self-contained `.slurm` files submitted with a
 plain `sbatch <file>.slurm`; each file sets its account, GPU type, task rows
@@ -34,18 +35,29 @@ and flags itself. The full workflow, hardware and memory settings, and how to
 read the results are in [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md).
 
 ```bash
-# 1. Train: copy a training file, set its #SBATCH --array (task rows), RUN_ROOT and flags
-cp pilot_train_noaug.slurm my_train.slurm && sbatch my_train.slurm
-# 2. Evaluate in simulation: copy eval.slurm (RoboCasa) or eval_robotwin.slurm (RoboTwin),
-#    point RUN_ROOT/METRICS_ROOT at the run, add #SBATCH --dependency=afterok:<train job>_<row>
+# 1. Train: copy the suite training file, set its RUN_ROOT, #SBATCH --array (task rows) and flags
+cp suite_train.slurm my_train.slurm && sbatch my_train.slurm
+# 2. Evaluate in simulation: copy suite_eval_robotwin.slurm or suite_eval_robocasa.slurm,
+#    point RUN_ROOT/METRICS_ROOT at the run, set #SBATCH --dependency=afterany:<train job>
 sbatch my_eval_robotwin.slurm
 # 3. Summarize success rate, queries and timing per mode
-python -m scripts.benchmarks.summarize_metrics eval_metrics/<run>-robotwin/robotwin/<task>/demo_clean
+python -m scripts.benchmarks.summarize_metrics eval_metrics/<run>/robotwin/<task>/demo_clean
 ```
+
+The recipe these files run, with the evidence for each setting and its known
+problems, is in [training_recipe.md](training_recipe.md).
 
 | File | What it runs |
 |---|---|
+| `suite_train.slurm` | **Current recipe**: pi0.5 encoder (frozen, joint), robot state, no augmentation, padded episode ends; 8 RoboTwin and 8 RoboCasa tasks on H100 (OpenDrawer: `suite_train_opendrawer.slurm`) |
+| `suite_eval_robotwin.slurm`, `suite_eval_robocasa.slurm` | Evaluation of the suite: RoboTwin `demo_clean` in 4 shards of 25 episodes, RoboCasa 50 episodes; adaptive and fixed query intervals (H100) |
+| `recipe_pilot_*.slurm` | Recipe pilot: no robot state, twice the action steps (four dev tasks) |
+| `crop_pilot_*.slurm` | Crop-fix pilot: whole-frame images, trimmed idle rows, Gemma layer-6 readout (four RoboTwin tasks, two runs each) |
+| `backbone_train.slurm`, `backbone_eval_*.slurm` | Backbone comparison: SigLIP, pi0, pi0.5, GR00T on four dev tasks |
 | `run.slurm` | Basic training with epoch defaults (H100); add `#SBATCH --array=<task rows>` before use |
+| `eval.slurm`, `eval_robotwin.slurm` | Generic simulator evaluation, RoboCasa / sharded RoboTwin (H100) |
+| `bench_v100.slurm`, `bench_backbones_a100.slurm` | Speed and memory measurements before sizing step budgets |
+
 ---
 
 ## Step 1: Install
@@ -70,25 +82,30 @@ pip install -e ".[dev]"
 
 The backbone is the frozen vision-language encoder that turns camera images and
 the instruction into features ([Step 5](#step-5-choose-the-backbone)). Weights
-download from Hugging Face on first use. On a machine without internet access, download them once on a connected machine that shares
+download from Hugging Face on first use. On a machine without internet access
+(Jean Zay compute nodes), download them once on a connected machine that shares
 the same `HF_HOME`, then set `HF_HUB_OFFLINE=1` (the Slurm files already do).
 
 | `--vlm_name` | Download | Size |
 |---|---|---|
-| `google/siglip-base-patch16-224` (default) | `python -c "from transformers import AutoModel, AutoProcessor as P; m='google/siglip-base-patch16-224'; AutoModel.from_pretrained(m); P.from_pretrained(m)"` | 0.8 GB |
+| `google/siglip-base-patch16-224` | `python -c "from transformers import AutoModel, AutoProcessor as P; m='google/siglip-base-patch16-224'; AutoModel.from_pretrained(m); P.from_pretrained(m)"` | 0.8 GB |
 | `pi0` | `python -c "from huggingface_hub import snapshot_download as d; d('lerobot/pi0_base', allow_patterns=['*.safetensors', 'config.json'])"` | 14 GB |
-| `pi05` | `python -c "from huggingface_hub import snapshot_download as d; d('lerobot/pi05_base', allow_patterns=['*.safetensors', 'config.json'])"` | 14 GB |
+| `pi05` (default) | `python -c "from huggingface_hub import snapshot_download as d; d('lerobot/pi05_base', allow_patterns=['*.safetensors', 'config.json'])"` | 14 GB |
 | `gr00t` | `python -c "from huggingface_hub import snapshot_download as d; d('nvidia/GR00T-N1.5-3B', allow_patterns=['*.safetensors', 'config.json'])"` | 5 GB |
 
 `pi0` and `pi05` also need the PaliGemma tokenizer, which is gated: accept its
 license on Hugging Face, log in (`huggingface-cli login`), then run
 `python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('google/paligemma-3b-pt-224')"`.
-The Eagle tokenizer of `gr00t` ships with the repository. 
+The Eagle tokenizer of `gr00t` ships with the repository. On Jean Zay all four
+are already in `$HOME/.cache/huggingface`.
 
 ## Step 2: Check the installation
 
 ```bash
-# 1. Unit and integration tests (CPU). 
+# 1. Unit and integration tests (CPU). On Jean Zay, use the training interpreter,
+#    cap the threads (otherwise the run takes ~50 min on a login node), skip the
+#    user-site TensorFlow (it breaks the transformers import) and write no caches
+#    (WORK has a file quota):
 USE_TF=0 OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONDONTWRITEBYTECODE=1 \
     tmp/train-env/bin/python -m pytest tests -q -p no:cacheprovider --continue-on-collection-errors
 
@@ -103,13 +120,15 @@ python -m scripts.eval_robotwin \
 
 Notes:
 
-- **Test status (Oct 15, 2026): not green.** 70 pass and 26 fail; the failures
-  predate the observation and backbone changes (see `analysis_low_success.md`).
+- **Test status (Oct 19, 2026): not green, unchanged since Oct 15.** 70 pass and
+  26 fail; the failures predate the observation and backbone changes (for
+  example, tests that still expect a separate gripper head: 6 motion channels
+  and a `gripper_loss`; see `analysis_low_success.md`).
   Two files, `tests/benchmarks/test_xpolicylab_benchmarks.py` and
   `tests/benchmarks/test_per_arm_knots.py`, fail to import (`integrate_twist`
   no longer exists in `adaspevla/benchmarks/pose_math.py`). With the thread caps
-  above the suite takes about 3.5 minutes; run single files with
-  `pytest tests/<file>.py` while you work.
+  above the suite takes 4–9 minutes, depending on the login node; run single
+  files with `pytest tests/<file>.py` while you work.
 - The smoke run uses `--no-proprio` because the smoke evaluator doesn't supply
   robot state yet; with robot state on it stops with "This policy conditions on
   robot state; pass proprio". The simulator evaluators do supply it.
@@ -218,13 +237,16 @@ flag.
 
 | `--vlm_name` | Vision encoder | Language encoder | Frozen params | A100 s/step (batch 32, 3 views) | GPU memory |
 |---|---|---|---|---|---|
-| `google/siglip-base-patch16-224` (default) | SigLIP-B/16, 224 px, 196 tokens per view | SigLIP text tower | 0.2B | 0.20 | 2.9 GB |
+| `google/siglip-base-patch16-224` | SigLIP-B/16, 224 px, 196 tokens per view | SigLIP text tower | 0.2B | 0.20 | 2.9 GB |
 | `pi0` | SigLIP-So400m/14 of pi0, 224 px, 256 tokens per view | Gemma-2B of pi0 | 2.9B | 0.86 | 12 GB |
-| `pi05` | SigLIP-So400m/14 of pi0.5 | Gemma-2B of pi0.5 | 2.9B | as pi0 (same architecture) | as pi0 |
+| `pi05` (default) | SigLIP-So400m/14 of pi0.5 | Gemma-2B of pi0.5 | 2.9B | as pi0 (same architecture) | as pi0 |
 | `gr00t` | SigLIP-So400m/14 of GR00T N1.5 (Eagle 2.5) | First 12 Qwen3-1.7B layers of GR00T N1.5 | 1.3B | 0.56 | 7.3 GB |
 
 Speeds are from `bench_backbones_a100.slurm` (job 1135286; patch tokens and
-robot state, no finetune stage). The trainable action head has 24M parameters
+robot state, no finetune stage). `pi05` is the default: it had the best mean success in the
+backbone comparison (`backbone-cmp-20261016-pad`, frozen encoders, adaptive timing:
+pi0.5 34%, GR00T 29%, SigLIP-B 27%, pi0 21% over beat_block_hammer, press_stapler,
+CloseFridge and SlideDishwasherRack). The trainable action head has 24M parameters
 with SigLIP-B and 28M with the others.
 
 ```bash
@@ -259,6 +281,10 @@ Defaults train the full model: patch-token memory, robot state, and a
 reproduce the earlier pooled-feature model, pass
 `--no-spatial_tokens --no-proprio --vision_finetune_layers 0`.
 
+The benchmark recipe differs from these defaults (no finetune stage, padded
+episode ends, batch 32, fixed step budgets); its exact flags are in
+[training_recipe.md](training_recipe.md).
+
 **Stages and optimization**
 
 | Option | Default | Meaning |
@@ -269,6 +295,8 @@ reproduce the earlier pooled-feature model, pass
 | `--action_steps`, `--finetune_steps`, `--timing_steps` | off | Optimizer steps per stage; each overrides the matching epoch count |
 | `--batch_size`, `--lr` | 8, 2e-4 | Optimizer settings |
 | `--warmup_steps` | 500 | Linear warmup (at most 10% of a stage), then cosine decay |
+| `--resume` | off | Continue from the newest stage checkpoint in `--output_dir`; stage checkpoints then also store the optimizer and schedule |
+| `--stop_after_minutes` | off | Save a resumable stage checkpoint and stop after this wall time (chained short jobs; use with `--resume`) |
 | `--num_workers` | 8 | DataLoader workers |
 | `--device` | `cuda` if available | Training device |
 
@@ -276,9 +304,11 @@ reproduce the earlier pooled-feature model, pass
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--vlm_name` | `google/siglip-base-patch16-224` | Vision-language encoder: a Hugging Face SigLIP model, or `pi0`, `pi05`, `gr00t` ([Step 5](#step-5-choose-the-backbone)) |
+| `--vlm_name` | `pi05` | Vision-language encoder: a Hugging Face SigLIP model, or `pi0`, `pi05`, `gr00t` ([Step 5](#step-5-choose-the-backbone)) |
 | `--vlm_mode` | `joint` | `pi0`/`pi05`/`gr00t`: images and instruction through the language model together (`joint`) or the instruction alone (`separate`) |
 | `--vlm_dtype` | `auto` | `pi0`/`pi05`/`gr00t` language model: `auto` = bfloat16 on Ampere or newer, else float32; or `bfloat16`, `float16`, `float32` |
+| `--vlm_layers` | all | `pi0`/`pi05`/`gr00t`: run only the first N language-model layers and read their final-norm output |
+| `--image_fit` | `crop` | `crop`: centred square of 90% of the short side (drops the sides of 4:3 frames such as RoboTwin's 320x240); `pad`: letterbox the whole frame to a square, as pi0 does (needs `--no-augment`) |
 | `--spatial_tokens` / `--no-spatial_tokens` | on | The flow cross-attends to all patch tokens of every view; off = one pooled feature vector |
 | `--proprio` / `--no-proprio` | on | Condition on robot state: base-frame end-effector position, 6-D rotation and last gripper command, per arm |
 | `--augment` / `--no-augment` | off | Random 90% crop and ±20% colour jitter while training (spatial mode); evaluation uses a centre crop |
@@ -307,6 +337,8 @@ reproduce the earlier pooled-feature model, pass
 | `--supported_horizons 0.1 0.3` | off | Timestamped windows with horizons in this range (seconds) |
 | `--horizon_duration` | median window | Inference horizon in seconds, inside training support |
 | `--control_dt` | 0.02 | Shortest allowed window, in seconds |
+| `--pad_episode_end` | off | Also anchor windows in the last `chunk_horizon - 1` samples, holding the final pose and width after the demo ends; without it the motion that completes the task is never a query state. The benchmark recipe turns it on |
+| `--max_idle_rows N` | off | Shorten every run of motionless demo rows (no arm moves, widths unchanged) to N rows and close the time gap |
 
 ## Segment demonstrations into adaptive action chunks
 
@@ -381,7 +413,10 @@ per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
    `--supported_horizons 0.1 0.3` selects nearby observed endpoints within that
    supported range; otherwise `--chunk_horizon 16` keeps fixed sample-count
    windows. Windows never cross a recorded terminal sample and must span at least
-   `--control_dt`.
+   `--control_dt`. `--pad_episode_end` repeats the final pose and width after the
+   last sample so that the last `chunk_horizon - 1` samples are anchors too.
+   `--max_idle_rows N` first shortens every run of motionless samples to N and
+   shifts later timestamps back by the removed time.
 2. Calibrate six motion scales as the 95th percentile of absolute offsets over
    all samples of all training windows, pooling corresponding channels across
    arms (so they depend on the horizon range). A positive floor defaults to
@@ -420,6 +455,11 @@ per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
 In spatial mode, and always for pi0, pi0.5 and GR00T, images are cropped to a
 centred square of 90% of the shorter side (a random crop with `--augment`),
 resized to the encoder's input size and normalized as that encoder expects.
+On non-square frames this drops the sides: for RoboTwin's 320×240 cameras the
+model sees only the central 216×216, and objects near the table edges are out
+of view. `--image_fit pad` instead letterboxes the whole frame to a square with
+black bars before resizing, as pi0 does (no random-crop augmentation in this
+mode). The choice is saved in the checkpoint; older checkpoints keep the crop.
 Model-loading failures propagate; the offline test backbone is selected only by
 `--test_backbone`.
 
@@ -446,7 +486,10 @@ instruction tokens. In `joint` mode the memory holds the language-model outputs
 at the image positions; with vision fine-tuning, gradients pass through the
 frozen language model, which is recomputed layer by layer to save memory. In
 `separate` mode the memory holds the projected vision tokens and the
-instruction feature is cached per instruction.
+instruction feature is cached per instruction. `--vlm_layers N` builds only the
+first N decoder layers (the rest are never loaded) and applies the final norm
+after layer N; with pi0.5, linear probes decode the target position best around
+layers 3–6, and N = 6 also runs a third of the language model per query.
 
 The Gemma and Qwen3 decoders are implemented in the repository and checked
 against transformers on the same weights, so these backbones run unchanged in

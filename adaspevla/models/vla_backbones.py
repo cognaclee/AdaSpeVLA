@@ -256,9 +256,13 @@ class PretrainedVLAEncoder(nn.Module):
     The frozen language model is stored in ``dtype``. The vision tower and
     projector, which the finetune stage trains, stay float32 (bfloat16 weights
     would round away small optimizer updates) and run under autocast to ``dtype``.
+
+    ``lm_layers`` keeps only the first decoder layers and applies the final norm
+    after the last kept one (linear probes on demos: target-position information
+    peaks around pi0.5 layers 3-6 and fades by layer 18). ``None`` keeps all.
     """
 
-    def __init__(self, name, mode="joint", dtype="auto"):
+    def __init__(self, name, mode="joint", dtype="auto", lm_layers=None):
         super().__init__()
         from transformers import AutoTokenizer, SiglipVisionConfig, SiglipVisionModel
 
@@ -270,7 +274,12 @@ class PretrainedVLAEncoder(nn.Module):
         self.key, self.mode, self.spec = key, mode, VLA_BACKBONES[key]
         self.family = self.spec["family"]
         self.dtype = resolve_dtype(dtype)
-        lm_spec = self.spec["lm"]
+        lm_spec = dict(self.spec["lm"])
+        if lm_layers is not None:
+            if not 1 <= int(lm_layers) <= lm_spec["layers"]:
+                raise ValueError(f"lm_layers must be in [1, {lm_spec['layers']}] for {key}")
+            # Later layers are absent from the module, so their weights are never loaded.
+            lm_spec["layers"] = int(lm_layers)
         self.hidden_size = lm_spec["hidden"]
         vision_config = SiglipVisionConfig(**SIGLIP_SO400M_14_224)
         vision_config._attn_implementation = "sdpa"

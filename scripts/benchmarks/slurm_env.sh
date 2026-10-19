@@ -13,6 +13,8 @@ TRAINING_PYTHON="${TRAINING_PYTHON:-$ADASPEVLA_ROOT/tmp/train-env/bin/python}"
 [[ -x "$TRAINING_PYTHON" ]] || { echo "Create tmp/train-env or set TRAINING_PYTHON to a compatible training interpreter" >&2; exit 1; }
 export PATH="$(dirname "$TRAINING_PYTHON"):$PATH"
 export ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/lustre/fswork/projects/rech/sdh/ueh86le/GrassmannPolicy/RoboTwin}"
+# RoboTwin seeds whose episode hangs the simulator (read by eval_policy_xpolicylab.py)
+export ROBOTWIN_SKIP_SEEDS_FILE="${ROBOTWIN_SKIP_SEEDS_FILE:-$ADASPEVLA_ROOT/scripts/benchmarks/robotwin_skip_seeds.tsv}"
 export PYTHONPATH="$ADASPEVLA_ROOT:$ADASPEVLA_ROOT/robocasa:$ADASPEVLA_ROOT/robosuite:$(dirname "$ROBOTWIN_ROOT")${PYTHONPATH:+:$PYTHONPATH}"
 export SAPIEN_NO_DRM=1 EGL_PLATFORM=device MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"

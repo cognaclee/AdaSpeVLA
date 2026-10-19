@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument(
         "--vlm_name",
         type=str,
-        default="google/siglip-base-patch16-224",
+        default="pi05",
         help="VLM backbone",
     )
     parser.add_argument(

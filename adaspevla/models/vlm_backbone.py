@@ -35,6 +35,8 @@ class MultiCameraVLMBackbone(nn.Module):
         crop_ratio=0.9,
         vlm_mode="joint",
         vlm_dtype="auto",
+        image_fit="crop",
+        vlm_layers=None,
     ):
         super().__init__()
         if use_lora:
@@ -45,6 +47,13 @@ class MultiCameraVLMBackbone(nn.Module):
         self.freeze_backbone, self.test_mode = freeze_backbone, test_mode
         self.spatial_tokens, self.proprio_dim = bool(spatial_tokens), int(proprio_dim)
         self.augment, self.crop_ratio = bool(augment), float(crop_ratio)
+        if image_fit not in ("crop", "pad"):
+            raise ValueError("image_fit must be 'crop' or 'pad'")
+        if image_fit == "pad" and self.augment:
+            raise ValueError("image_fit='pad' has no random-crop augmentation; use --no-augment")
+        # crop: centred square of crop_ratio * the short side (drops the sides of
+        # 4:3 frames); pad: letterbox the whole frame to a square, as pi0 does.
+        self.image_fit = image_fit
         self.trainable_vision_layers = 0
         # Backbone weights trained at some point; the rest are reloaded from the
         # pretrained files instead of being saved in checkpoints.
@@ -63,7 +72,9 @@ class MultiCameraVLMBackbone(nn.Module):
             self.processor = None
         elif vla_backbone_key(model_name) is not None:
             self.is_vla, self.processor, self.text_encoder = True, None, None
-            self.vision_encoder = PretrainedVLAEncoder(model_name, vlm_mode, vlm_dtype)
+            self.vision_encoder = PretrainedVLAEncoder(
+                model_name, vlm_mode, vlm_dtype, lm_layers=vlm_layers
+            )
             self.feature_dim = self.text_feature_dim = self.vision_encoder.hidden_size
             self.image_size = self.vision_encoder.image_size
             # SigLIP-So400m in pi0 and Eagle maps [0,1] to [-1,1].
@@ -72,6 +83,10 @@ class MultiCameraVLMBackbone(nn.Module):
         else:
             from transformers import AutoModel, AutoProcessor
 
+            if vlm_layers is not None:
+                raise ValueError("vlm_layers applies to the pi0, pi05 and gr00t encoders only")
+            if image_fit != "crop" and not self.spatial_tokens:
+                raise ValueError("image_fit='pad' needs spatial_tokens (legacy mode uses the processor)")
             self.processor = AutoProcessor.from_pretrained(model_name)
             self.vision_encoder = AutoModel.from_pretrained(model_name)
             config = self.vision_encoder.config
@@ -202,6 +217,10 @@ class MultiCameraVLMBackbone(nn.Module):
                 1, keepdim=True
             )
             crops = ((crops - gray) * jitter() + gray).clamp(0, 1)
+        elif self.image_fit == "pad":
+            side = max(H, W)
+            top, left = (side - H) // 2, (side - W) // 2
+            crops = F.pad(flat, (left, side - W - left, top, side - H - top))  # black bars
         else:
             y, x = (H - side) // 2, (W - side) // 2
             crops = flat[:, :, y : y + side, x : x + side]

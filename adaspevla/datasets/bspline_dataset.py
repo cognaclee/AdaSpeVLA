@@ -19,6 +19,30 @@ from ..bspline.learnable_knots import (
     query_interval_target,
 )
 
+# A row is idle when no arm moved more than these since the previous row.
+IDLE_TRANSLATION_M, IDLE_ROTATION_RAD, IDLE_WIDTH = 1e-3, 1e-2, 1e-3
+
+
+def idle_keep_mask(poses, widths, max_idle_rows):
+    """Rows to keep when every run of idle rows is shortened to ``max_idle_rows``.
+
+    poses (T, arms, 7) xyz+wxyz, widths (T, arms). The first row and every row
+    that moves are kept; within an idle run only its first ``max_idle_rows``.
+    """
+    moved = np.linalg.norm(np.diff(poses[..., :3], axis=0), axis=-1)
+    dot = np.abs(np.sum(poses[1:, :, 3:] * poses[:-1, :, 3:], axis=-1)).clip(0, 1)
+    turned = 2 * np.arccos(dot)
+    changed = np.abs(np.diff(widths, axis=0))
+    idle = (
+        (moved < IDLE_TRANSLATION_M) & (turned < IDLE_ROTATION_RAD) & (changed < IDLE_WIDTH)
+    ).all(axis=1)
+    keep = np.ones(len(poses), dtype=bool)
+    run = 0
+    for row, still in enumerate(idle, start=1):
+        run = run + 1 if still else 0
+        keep[row] = run <= max_idle_rows
+    return keep
+
 
 class UniversalBSplineDataset(Dataset):
     def __init__(
@@ -43,7 +67,11 @@ class UniversalBSplineDataset(Dataset):
         per_arm_knots=False,
         gripper_density_gain=10.0,
         gripper_threshold=0.5,
+        pad_episode_end=False,
+        max_idle_rows=None,
     ):
+        if max_idle_rows is not None and int(max_idle_rows) < 0:
+            raise ValueError("max_idle_rows must be nonnegative")
         if per_arm_knots and action_dim != 14:
             raise ValueError("Per-arm knots require two arms (14 action channels)")
         # Ablation: one span target per arm, from that arm's own motion.
@@ -85,6 +113,7 @@ class UniversalBSplineDataset(Dataset):
         self.include_diagnostic_targets = True
         self.samples = []
         prepared = []
+        idle_rows_removed = 0
         for original in episodes:
             ep = dict(original)
             poses, widths, times, world_from_base = canonicalize_episode(ep, action_dim)
@@ -110,9 +139,18 @@ class UniversalBSplineDataset(Dataset):
             for key in ("images", "criticality", "query_intervals"):
                 if key in ep:
                     ep[key] = np.asarray(ep[key])[:end]
-            prepared.append(
-                (ep, poses[:end], widths[:end], times[:end], world_from_base)
-            )
+            poses, widths, times = poses[:end], widths[:end], times[:end]
+            if max_idle_rows is not None:
+                keep = idle_keep_mask(poses, widths, int(max_idle_rows))
+                # Close the time gaps left by dropped rows; motion timing is unchanged.
+                step = np.diff(times, prepend=times[0])
+                times = (times - np.cumsum(np.where(keep, 0.0, step)))[keep]
+                poses, widths = poses[keep], widths[keep]
+                for key in ("images", "criticality", "query_intervals"):
+                    if key in ep:
+                        ep[key] = ep[key][keep]
+                idle_rows_removed += int((~keep).sum())
+            prepared.append((ep, poses, widths, times, world_from_base))
         if not prepared:
             raise ValueError("No complete episodes before termination")
         conversions = [
@@ -144,7 +182,18 @@ class UniversalBSplineDataset(Dataset):
                     raise ValueError(
                         "query_intervals must be length T; invalid values use fallback labels"
                     )
-            for start in range(0, len(poses) - 1, anchor_stride):
+            num_samples = len(poses)
+            if pad_episode_end and num_samples > 1:
+                # Demos stop when the task succeeds. Without padding the last
+                # chunk_horizon-1 samples (the motion that completes the task) are
+                # never anchors; hold the final pose and width after the end instead.
+                pad = chunk_horizon - 1
+                dt = float(np.median(np.diff(times)))
+                poses = np.concatenate((poses, np.repeat(poses[-1:], pad, axis=0)))
+                widths = np.concatenate((widths, np.repeat(widths[-1:], pad, axis=0)))
+                times = np.concatenate((times, times[-1] + dt * np.arange(1, pad + 1)))
+                criticality = np.concatenate((criticality, np.repeat(criticality[-1:], pad)))
+            for start in range(0, num_samples - 1, anchor_stride):
                 if supported_horizons is None:
                     stops = (
                         [start + chunk_horizon]
@@ -267,6 +316,12 @@ class UniversalBSplineDataset(Dataset):
         )
         if self.per_arm_knots:
             self.calibration["per_arm_knots"] = True
+        if pad_episode_end:
+            self.calibration["pad_episode_end"] = True
+        if max_idle_rows is not None:
+            self.calibration.update(
+                max_idle_rows=int(max_idle_rows), idle_rows_removed=idle_rows_removed
+            )
         if conversions:
             if any(meta != conversions[0] for meta in conversions):
                 raise ValueError("Native conversion conventions differ across episodes")

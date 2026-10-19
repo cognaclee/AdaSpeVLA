@@ -1,0 +1,10 @@
+# RoboTwin evaluation seeds skipped by eval_policy_xpolicylab.py (ROBOTWIN_SKIP_SEEDS_FILE, set in slurm_env.sh).
+# Columns (tab-separated): task, task_config, seed, reason. Lines starting with # are ignored.
+# stamp_seal demo_clean: the episode after seed 200046 (shard 1) and after 400012 (shard 3) deadlocks SAPIEN's
+# ray-traced camera render (OIDN denoiser, cudaStreamSynchronize never returns, GPU idle) in every query mode and
+# checkpoint, so the job sits until the 20h limit. The expert check that picks the next seed is not reproducible
+# across processes, so both candidates of each shard are skipped (2026-10-16, jobs 1096433 and 1091166).
+stamp_seal	demo_clean	200047	hangs ray-traced render (candidate)
+stamp_seal	demo_clean	200048	hangs ray-traced render (candidate)
+stamp_seal	demo_clean	400013	hangs ray-traced render (candidate)
+stamp_seal	demo_clean	400014	hangs ray-traced render (candidate)

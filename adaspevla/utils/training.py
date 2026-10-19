@@ -55,6 +55,20 @@ def add_method_arguments(parser):
         "else float32. The vision tower stays float32 and runs under autocast",
     )
     parser.add_argument(
+        "--vlm_layers",
+        type=int,
+        default=None,
+        help="pi0/pi05/gr00t: run only the first N language-model layers and read their "
+        "final-norm output (default: all layers)",
+    )
+    parser.add_argument(
+        "--image_fit",
+        choices=["crop", "pad"],
+        default="crop",
+        help="crop: centred square of 0.9 x the short side (drops the sides of 4:3 frames); "
+        "pad: letterbox the whole frame to a square (needs --no-augment)",
+    )
+    parser.add_argument(
         "--vision_finetune_layers",
         type=int,
         default=4,
@@ -77,10 +91,39 @@ def add_method_arguments(parser):
         "--timing_steps", type=int, default=None, help="Overrides --timing_epochs"
     )
     parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from the newest stage checkpoint in --output_dir; stage checkpoints "
+        "then also store the optimizer and schedule",
+    )
+    parser.add_argument(
+        "--stop_after_minutes",
+        type=float,
+        default=None,
+        help="Save a resumable stage checkpoint and stop once this wall time has passed "
+        "(for chained short jobs; use with --resume)",
+    )
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--supported_horizons", type=float, nargs="+", default=None)
     parser.add_argument("--control_dt", type=float, default=0.02)
     parser.add_argument("--anchor_stride", type=int, default=1)
+    parser.add_argument(
+        "--pad_episode_end",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also anchor windows in the last chunk_horizon-1 samples, holding the final "
+        "pose and width after the demo ends (otherwise the task-completing motion is never "
+        "a query state). Off by default so queued runs keep their data contract",
+    )
+    parser.add_argument(
+        "--max_idle_rows",
+        type=int,
+        default=None,
+        help="Shorten every run of motionless demo rows (all arms static, width unchanged) "
+        "to at most N rows and close the time gap; scripted experts pause up to ~30 rows, "
+        "and an unchanged image cannot tell the policy how long it has waited",
+    )
     parser.add_argument("--e_crit", type=float, default=None)
     parser.add_argument("--event_quantile", type=float, default=0.95)
     parser.add_argument("--anticipation_margin", type=float, default=0.0)
@@ -131,6 +174,8 @@ def window_options(args):
             "supported_horizons",
             "control_dt",
             "anchor_stride",
+            "pad_episode_end",
+            "max_idle_rows",
             "e_crit",
             "event_quantile",
             "anticipation_margin",
@@ -195,6 +240,8 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         vision_finetune_layers=finetune_layers,
         vlm_mode=getattr(args, "vlm_mode", "joint"),
         vlm_dtype=getattr(args, "vlm_dtype", "auto"),
+        image_fit=getattr(args, "image_fit", "crop"),
+        vlm_layers=getattr(args, "vlm_layers", None),
     ).to(args.device)
     workers = int(getattr(args, "num_workers", 0) or 0)
     loader = DataLoader(
@@ -242,9 +289,24 @@ def train_two_stage(args, dataset, benchmark, action_dim):
     vision_scale = float(getattr(args, "vision_lr_scale", 0.1))
     # Log and checkpoint once per epoch, but at least every 2000 steps.
     log_every = max(1, min(len(loader), 2000))
-    for stage, total_steps in stages:
+    resumable = bool(getattr(args, "resume", False))
+    stop_minutes = getattr(args, "stop_after_minutes", None)
+    deadline = None if stop_minutes is None else time.time() + 60 * float(stop_minutes)
+    stage_file = lambda name: output / f"adaspevla_{benchmark}_{args.task_name}_{name}.pt"
+    resume, resume_index = None, -1
+    if resumable:
+        for index, (name, _) in enumerate(stages):
+            if stage_file(name).exists():
+                resume_index = index
+        if resume_index >= 0:
+            resume = torch.load(stage_file(stages[resume_index][0]), map_location="cpu", weights_only=False)
+            policy.load_checkpoint_state(resume["model_state"])
+            print(f"Resuming {stages[resume_index][0]} at step {resume['step']}", flush=True)
+    for index, (stage, total_steps) in enumerate(stages):
         if total_steps < 1:
             raise ValueError(f"Stage {stage} needs a positive step budget")
+        if index < resume_index or (index == resume_index and resume["step"] >= total_steps):
+            continue
         dataset.include_diagnostic_targets = stage != "timing"
         policy.set_training_stage(stage)
         policy.train()
@@ -271,7 +333,19 @@ def train_two_stage(args, dataset, benchmark, action_dim):
             "vision trainable parameters",
             flush=True,
         )
-        step, running, started = 0, 0.0, time.time()
+        step, running, counted, started = 0, 0.0, 0, time.time()
+        if index == resume_index and "optimizer_state" in resume:
+            optimizer.load_state_dict(resume["optimizer_state"])
+            scheduler.load_state_dict(resume["scheduler_state"])
+            step = int(resume["step"])
+        elif index == resume_index:
+            # A checkpoint saved without --resume: keep its step and learning-rate schedule,
+            # with fresh optimizer moments.
+            step = int(resume["step"])
+            for _ in range(step):
+                scheduler.step()
+            print(f"{stage}: no optimizer state saved; fresh AdamW moments from step {step}", flush=True)
+        first_step = step
         while step < total_steps:
             for raw in loader:
                 batch = {key: move(value) for key, value in raw.items()}
@@ -282,15 +356,16 @@ def train_two_stage(args, dataset, benchmark, action_dim):
                 optimizer.step()
                 scheduler.step()
                 running += loss.item()
+                counted += 1
                 step += 1
-                if step % log_every == 0 or step == total_steps:
-                    count = step % log_every or log_every
+                stopping = deadline is not None and time.time() > deadline and step < total_steps
+                if step % log_every == 0 or step == total_steps or stopping:
                     print(
-                        f"{stage} step {step}/{total_steps}: loss={running / count:.6f} "
-                        f"({(time.time() - started) / step:.3f} s/step)",
+                        f"{stage} step {step}/{total_steps}: loss={running / counted:.6f} "
+                        f"({(time.time() - started) / (step - first_step):.3f} s/step)",
                         flush=True,
                     )
-                    running = 0.0
+                    running, counted = 0.0, 0
                     checkpoint = dict(
                         model_state=policy.checkpoint_state_dict(),
                         model_config=policy.config,
@@ -301,15 +376,20 @@ def train_two_stage(args, dataset, benchmark, action_dim):
                         calibration=dataset.calibration,
                         args=vars(args),
                     )
-                    torch.save(
-                        checkpoint,
-                        output / f"adaspevla_{benchmark}_{args.task_name}_{stage}.pt",
-                    )
                     if stage == "timing" and step == total_steps:
                         torch.save(
                             checkpoint,
                             output / f"adaspevla_{benchmark}_{args.task_name}_latest.pt",
                         )
+                    if resumable:
+                        checkpoint.update(
+                            optimizer_state=optimizer.state_dict(),
+                            scheduler_state=scheduler.state_dict(),
+                        )
+                    torch.save(checkpoint, stage_file(stage))
+                if stopping:
+                    print(f"Stopped for resume at {stage} step {step}/{total_steps}", flush=True)
+                    return None
                 if step >= total_steps:
                     break
     return policy

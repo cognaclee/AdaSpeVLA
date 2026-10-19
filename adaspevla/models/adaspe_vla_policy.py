@@ -30,7 +30,7 @@ from ..datasets.action_contract import (
 class AdaSpeVLAPolicy(nn.Module):
     def __init__(
         self,
-        vlm_name="google/siglip-base-patch16-224",
+        vlm_name="pi05",
         action_dim=7,
         num_control_points=8,
         degree=3,
@@ -63,6 +63,8 @@ class AdaSpeVLAPolicy(nn.Module):
         vision_finetune_layers=0,
         vlm_mode="joint",
         vlm_dtype="auto",
+        image_fit="crop",
+        vlm_layers=None,
     ):
         super().__init__()
         if knot_supervision not in ("kl", "position"):
@@ -162,6 +164,10 @@ class AdaSpeVLAPolicy(nn.Module):
         if vla_backbone_key(vlm_name) is not None and not test_mode:
             # pi0 / pi0.5 / GR00T encoder: how images and text meet, and its dtype.
             self.config.update(vlm_mode=vlm_mode, vlm_dtype=vlm_dtype)
+            if vlm_layers is not None:
+                self.config["vlm_layers"] = int(vlm_layers)
+        if image_fit != "crop":
+            self.config["image_fit"] = image_fit
         if self.proprio_dim:
             if proprio_mean is None or proprio_std is None:
                 raise ValueError("Robot-state conditioning needs proprio_mean and proprio_std")
@@ -193,6 +199,8 @@ class AdaSpeVLAPolicy(nn.Module):
             augment=bool(augment),
             vlm_mode=vlm_mode,
             vlm_dtype=vlm_dtype,
+            image_fit=image_fit,
+            vlm_layers=vlm_layers,
         )
         self.knot_head = LearnableKnotPlacementHead(
             cond_dim,
