@@ -66,13 +66,21 @@ def add_method_arguments(parser):
         choices=["crop", "pad"],
         default="crop",
         help="crop: centred square of 0.9 x the short side (drops the sides of 4:3 frames); "
-        "pad: letterbox the whole frame to a square (needs --no-augment)",
+        "pad: letterbox the whole frame to a square (with --augment: random shifts of up to "
+        "5%% of the side instead of random crops)",
     )
     parser.add_argument(
         "--vision_finetune_layers",
         type=int,
         default=4,
         help="SigLIP vision blocks trained in the finetune stage (0 skips it)",
+    )
+    parser.add_argument(
+        "--vlm_finetune_layers",
+        type=int,
+        default=0,
+        help="pi0/pi05/gr00t: last language-model layers (of those kept) trained in the "
+        "finetune stage at the vision learning rate, kept in float32 (0: frozen)",
     )
     parser.add_argument("--finetune_epochs", type=int, default=5)
     parser.add_argument(
@@ -127,9 +135,32 @@ def add_method_arguments(parser):
     parser.add_argument("--e_crit", type=float, default=None)
     parser.add_argument("--event_quantile", type=float, default=0.95)
     parser.add_argument("--anticipation_margin", type=float, default=0.0)
+    parser.add_argument(
+        "--min_query_interval",
+        type=float,
+        default=0.02,
+        help="Shortest query interval (s) the timing head can predict; shorter timing "
+        "labels are raised to it",
+    )
+    parser.add_argument(
+        "--max_query_interval",
+        type=float,
+        default=0.5,
+        help="Longest query interval (s) the timing head can predict (at most the window)",
+    )
+    parser.add_argument(
+        "--timing_loss",
+        choices=["log_mse", "log_l1"],
+        default="log_mse",
+        help="Timing-head loss on log intervals: squared error (fits the mean) or "
+        "absolute error (fits the median)",
+    )
     parser.add_argument("--scale_floor", type=float, default=1e-6)
     parser.add_argument("--timing_probe_count", type=int, default=16)
     parser.add_argument("--num_ode_steps", type=int, default=15)
+    parser.add_argument("--flow_hidden_dim", type=int, default=384, help="Action expert width")
+    parser.add_argument("--flow_num_layers", type=int, default=6, help="Action expert blocks")
+    parser.add_argument("--flow_num_heads", type=int, default=6, help="Action expert attention heads")
     parser.add_argument(
         "--per_arm_knots",
         action="store_true",
@@ -179,6 +210,8 @@ def window_options(args):
             "e_crit",
             "event_quantile",
             "anticipation_margin",
+            "min_query_interval",
+            "max_query_interval",
             "scale_floor",
             "gripper_density_gain",
             "gripper_threshold",
@@ -198,8 +231,9 @@ def train_two_stage(args, dataset, benchmark, action_dim):
     spatial = bool(getattr(args, "spatial_tokens", False))
     use_proprio = bool(getattr(args, "proprio", False))
     finetune_layers = int(getattr(args, "vision_finetune_layers", 0) or 0) if spatial else 0
+    vlm_finetune = int(getattr(args, "vlm_finetune_layers", 0) or 0) if spatial else 0
     if getattr(args, "test_backbone", False):
-        finetune_layers = min(finetune_layers, 1)
+        finetune_layers, vlm_finetune = min(finetune_layers, 1), 0
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     durations = torch.tensor([record[2][-1] for record in dataset.samples])
@@ -224,9 +258,13 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         timing_probe_count=args.timing_probe_count,
         timing_num_ode_steps=args.num_ode_steps,
         horizon_duration=horizon,
+        min_query_interval=getattr(args, "min_query_interval", 0.02),
+        max_query_interval=getattr(args, "max_query_interval", 0.5),
+        timing_loss=getattr(args, "timing_loss", "log_mse"),
         supported_horizon_range=[float(durations.min()), float(durations.max())],
-        flow_hidden_dim=48 if args.test_backbone else 384,
-        flow_num_layers=1 if args.test_backbone else 6,
+        flow_hidden_dim=48 if args.test_backbone else getattr(args, "flow_hidden_dim", 384),
+        flow_num_layers=1 if args.test_backbone else getattr(args, "flow_num_layers", 6),
+        flow_num_heads=6 if args.test_backbone else getattr(args, "flow_num_heads", 6),
         per_arm_knots=per_arm_knots,
         knot_loss_coeff=getattr(args, "knot_loss_coeff", 0.5),
         flow_loss_coeff=getattr(args, "flow_loss_coeff", 1.0),
@@ -238,6 +276,7 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         proprio_std=dataset.calibration["proprio_std"] if use_proprio else None,
         augment=spatial and bool(getattr(args, "augment", False)),
         vision_finetune_layers=finetune_layers,
+        vlm_finetune_layers=vlm_finetune,
         vlm_mode=getattr(args, "vlm_mode", "joint"),
         vlm_dtype=getattr(args, "vlm_dtype", "auto"),
         image_fit=getattr(args, "image_fit", "crop"),
@@ -272,7 +311,7 @@ def train_two_stage(args, dataset, benchmark, action_dim):
         return int(steps) if steps is not None else int(epochs) * len(loader)
 
     stages = [("action", budget(getattr(args, "action_steps", None), args.epochs))]
-    if finetune_layers:
+    if finetune_layers or vlm_finetune:
         stages.append(
             (
                 "finetune",
@@ -352,7 +391,12 @@ def train_two_stage(args, dataset, benchmark, action_dim):
                 optimizer.zero_grad(set_to_none=True)
                 loss, logs = policy.forward_loss(batch)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+                if not torch.isfinite(grad_norm):
+                    # One non-finite batch would otherwise turn every weight into NaN (seen once,
+                    # RoboTwin d110-aug press_stapler at step ~12.5k: NaN knots on the next batch).
+                    print(f"{stage} step {step + 1}: non-finite loss or gradient, batch skipped", flush=True)
+                    continue
                 optimizer.step()
                 scheduler.step()
                 running += loss.item()

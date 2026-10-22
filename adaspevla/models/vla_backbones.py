@@ -260,9 +260,13 @@ class PretrainedVLAEncoder(nn.Module):
     ``lm_layers`` keeps only the first decoder layers and applies the final norm
     after the last kept one (linear probes on demos: target-position information
     peaks around pi0.5 layers 3-6 and fades by layer 18). ``None`` keeps all.
+
+    ``lm_trainable_layers`` keeps the last kept decoder layers and the final norm
+    in float32 so the finetune stage can train them (also when the policy is
+    rebuilt for evaluation); the language model then runs under autocast.
     """
 
-    def __init__(self, name, mode="joint", dtype="auto", lm_layers=None):
+    def __init__(self, name, mode="joint", dtype="auto", lm_layers=None, lm_trainable_layers=0):
         super().__init__()
         from transformers import AutoTokenizer, SiglipVisionConfig, SiglipVisionModel
 
@@ -292,6 +296,11 @@ class PretrainedVLAEncoder(nn.Module):
         self._load_weights()
         self.requires_grad_(False)
         self.eval()
+        self.lm_trainable_layers = int(lm_trainable_layers)
+        if not 0 <= self.lm_trainable_layers <= len(self.lm.layers):
+            raise ValueError(f"lm_trainable_layers must be in [0, {len(self.lm.layers)}]")
+        for module in self._trainable_lm_modules():
+            module.float()
         self.tokenizer = AutoTokenizer.from_pretrained(self.spec["tokenizer"])
         self._ids_cache, self._text_cache = {}, {}
         if self.family == "eagle":
@@ -326,6 +335,21 @@ class PretrainedVLAEncoder(nn.Module):
                 module.register_buffer(
                     "position_ids", torch.arange(buffer.shape[-1]).expand(1, -1), persistent=False
                 )
+
+    def _trainable_lm_modules(self):
+        if not self.lm_trainable_layers:
+            return []
+        return [*self.lm.layers[-self.lm_trainable_layers :], self.lm.norm]
+
+    def set_trainable_lm_layers(self, train):
+        """Train (or freeze again) the float32 language-model layers and the final norm."""
+        for module in self._trainable_lm_modules():
+            module.requires_grad_(bool(train))
+
+    def _lm(self, x, mask):
+        # float32 trainable layers compute in dtype under autocast, as the frozen ones do.
+        with torch.autocast(x.device.type, self.dtype, enabled=self.dtype != torch.float32):
+            return self.lm(x, mask)
 
     def set_trainable_vision_layers(self, count):
         """Train the last ``count`` SigLIP blocks, its final norm and the projector."""
@@ -385,7 +409,7 @@ class PretrainedVLAEncoder(nn.Module):
             x = torch.cat(parts, dim=1)
             valid = torch.cat((text_valid.new_ones(B, n_img), text_valid), dim=1)
             mask = valid[:, None, None, :]
-            hidden = self.lm(x, mask)
+            hidden = self._lm(x, mask)
             image_out, text_out = hidden[:, :n_img], hidden[:, n_img:]
         else:
             # Eagle chat template, causal; <IMG_CONTEXT> embeddings are replaced.
@@ -400,7 +424,7 @@ class PretrainedVLAEncoder(nn.Module):
             L, P = x.shape[1], prefix.shape[1]
             valid = torch.cat((text_valid.new_ones(B, P), text_valid), dim=1)
             causal = torch.ones(L, L, dtype=torch.bool, device=device).tril()
-            hidden = self.lm(x, causal[None, None] & valid[:, None, None, :])
+            hidden = self._lm(x, causal[None, None] & valid[:, None, None, :])
             image_out = hidden[:, slots] if images is not None else None
             text_out = hidden[:, P:]
         weights = text_valid.unsqueeze(-1).to(text_out.dtype)

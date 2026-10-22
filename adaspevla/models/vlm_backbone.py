@@ -4,8 +4,9 @@ Legacy mode (``spatial_tokens=False``) conditions on one pooled image embedding
 per view. Spatial mode also returns a token memory for cross-attention: every
 SigLIP patch token of every view (plus a view embedding), the instruction and,
 when configured, the robot state. Spatial mode preprocesses on the GPU, applies
-random-crop and colour-jitter augmentation while training (centre crop at
-inference) and can fine-tune the last vision blocks.
+random-crop (crop fit) or random-shift (pad fit) and colour-jitter augmentation
+while training (no randomness at inference) and can fine-tune the last vision
+blocks.
 
 ``model_name`` may also name the observation encoder of a pretrained VLA
 (``pi0``, ``pi05``, ``gr00t``; see :mod:`.vla_backbones`). Its image tokens and
@@ -37,6 +38,7 @@ class MultiCameraVLMBackbone(nn.Module):
         vlm_dtype="auto",
         image_fit="crop",
         vlm_layers=None,
+        vlm_finetune_layers=0,
     ):
         super().__init__()
         if use_lora:
@@ -49,12 +51,14 @@ class MultiCameraVLMBackbone(nn.Module):
         self.augment, self.crop_ratio = bool(augment), float(crop_ratio)
         if image_fit not in ("crop", "pad"):
             raise ValueError("image_fit must be 'crop' or 'pad'")
-        if image_fit == "pad" and self.augment:
-            raise ValueError("image_fit='pad' has no random-crop augmentation; use --no-augment")
         # crop: centred square of crop_ratio * the short side (drops the sides of
         # 4:3 frames); pad: letterbox the whole frame to a square, as pi0 does.
+        # Augmented crop takes a random crop_ratio square; augmented pad shifts the
+        # letterboxed frame by up to (1 - crop_ratio) / 2 of its side (edges
+        # replicated), so training and inference see objects at the same scale.
         self.image_fit = image_fit
         self.trainable_vision_layers = 0
+        self.trainable_lm = False
         # Backbone weights trained at some point; the rest are reloaded from the
         # pretrained files instead of being saved in checkpoints.
         self._tuned_keys = set()
@@ -73,7 +77,8 @@ class MultiCameraVLMBackbone(nn.Module):
         elif vla_backbone_key(model_name) is not None:
             self.is_vla, self.processor, self.text_encoder = True, None, None
             self.vision_encoder = PretrainedVLAEncoder(
-                model_name, vlm_mode, vlm_dtype, lm_layers=vlm_layers
+                model_name, vlm_mode, vlm_dtype, lm_layers=vlm_layers,
+                lm_trainable_layers=vlm_finetune_layers,
             )
             self.feature_dim = self.text_feature_dim = self.vision_encoder.hidden_size
             self.image_size = self.vision_encoder.image_size
@@ -83,8 +88,10 @@ class MultiCameraVLMBackbone(nn.Module):
         else:
             from transformers import AutoModel, AutoProcessor
 
-            if vlm_layers is not None:
-                raise ValueError("vlm_layers applies to the pi0, pi05 and gr00t encoders only")
+            if vlm_layers is not None or vlm_finetune_layers:
+                raise ValueError(
+                    "vlm_layers and vlm_finetune_layers apply to the pi0, pi05 and gr00t encoders only"
+                )
             if image_fit != "crop" and not self.spatial_tokens:
                 raise ValueError("image_fit='pad' needs spatial_tokens (legacy mode uses the processor)")
             self.processor = AutoProcessor.from_pretrained(model_name)
@@ -154,8 +161,9 @@ class MultiCameraVLMBackbone(nn.Module):
                 self.text_encoder.eval()
         return self
 
-    def set_trainable_vision_layers(self, count):
-        """Train the last ``count`` vision blocks (0 freezes the encoder again).
+    def set_trainable_vision_layers(self, count, lm=False):
+        """Train the last ``count`` vision blocks (0 freezes the encoder again) and,
+        with ``lm``, a VLA encoder's float32 language-model layers.
 
         The text tower stays frozen. Encoders stay in eval mode: SigLIP has no
         batch statistics and zero dropout, so this only gates gradients.
@@ -175,7 +183,11 @@ class MultiCameraVLMBackbone(nn.Module):
                 vision.post_layernorm.requires_grad_(True)
                 if getattr(vision, "head", None) is not None:
                     vision.head.requires_grad_(True)
-        self.trainable_vision_layers = int(count)
+        if lm:
+            if not self.is_vla or not self.vision_encoder.lm_trainable_layers:
+                raise ValueError("Language-model fine-tuning needs a VLA encoder with vlm_finetune_layers")
+            self.vision_encoder.set_trainable_lm_layers(True)
+        self.trainable_vision_layers, self.trainable_lm = int(count), bool(lm)
         self.mark_tuned(
             name for name, p in self.vision_encoder.named_parameters() if p.requires_grad
         )
@@ -203,7 +215,16 @@ class MultiCameraVLMBackbone(nn.Module):
         """Crop (random while training, centre otherwise), jitter, resize, normalize."""
         N, _, H, W = flat.shape
         side = max(1, int(round(min(H, W) * self.crop_ratio)))
+        if self.image_fit == "pad":
+            side = max(H, W)
+            top, left = (side - H) // 2, (side - W) // 2
+            flat = F.pad(flat, (left, side - W - left, top, side - H - top))  # black bars
+            H = W = side
         if self.training and self.augment:
+            if self.image_fit == "pad":
+                shift = max(1, int(round(side * (1 - self.crop_ratio) / 2)))
+                flat = F.pad(flat, (shift,) * 4, mode="replicate")
+                H = W = side + 2 * shift
             ys = torch.randint(0, H - side + 1, (N,)).tolist()
             xs = torch.randint(0, W - side + 1, (N,)).tolist()
             crops = torch.stack(
@@ -218,9 +239,7 @@ class MultiCameraVLMBackbone(nn.Module):
             )
             crops = ((crops - gray) * jitter() + gray).clamp(0, 1)
         elif self.image_fit == "pad":
-            side = max(H, W)
-            top, left = (side - H) // 2, (side - W) // 2
-            crops = F.pad(flat, (left, side - W - left, top, side - H - top))  # black bars
+            crops = flat
         else:
             y, x = (H - side) // 2, (W - side) // 2
             crops = flat[:, :, y : y + side, x : x + side]
@@ -341,7 +360,8 @@ class MultiCameraVLMBackbone(nn.Module):
         B, V = images.shape[:2]
         prompts = self._prompt_list(instructions, B)
         pixels = self._pixels(images.reshape(-1, *images.shape[2:]))
-        with torch.set_grad_enabled(torch.is_grad_enabled() and self.trainable_vision_layers > 0):
+        trainable = self.trainable_vision_layers > 0 or self.trainable_lm
+        with torch.set_grad_enabled(torch.is_grad_enabled() and trainable):
             tokens, text = self.vision_encoder(pixels, prompts, V)
         dtype = self.fusion_proj[0].weight.dtype
         tokens, text = tokens.to(dtype), text.to(dtype)

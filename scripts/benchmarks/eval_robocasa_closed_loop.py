@@ -12,6 +12,7 @@ Example:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -36,6 +37,21 @@ def task_horizon(task_name):
     return get_task_horizon(task_name)
 
 
+def finished_episodes(path):
+    """Records already in a metrics file, by seed. A crash can leave a truncated last
+    line; it is dropped from the file so that episode runs again."""
+    if not path.exists():
+        return {}
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+    try:
+        if lines:
+            json.loads(lines[-1])
+    except json.JSONDecodeError:
+        lines = lines[:-1]
+        path.write_text("".join(line + "\n" for line in lines))
+    return {record["seed"]: record for record in map(json.loads, lines)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--ckpt_path", required=True)
@@ -49,6 +65,9 @@ def main():
     parser.add_argument("--skip_adaptive", action="store_true")
     parser.add_argument("--num_ode_steps", type=int, default=None)
     parser.add_argument("--metrics_dir", default="./eval_metrics/robocasa")
+    parser.add_argument("--resume", action="store_true",
+                        help="Keep episodes already in the metrics file and run only the missing "
+                        "seeds (restarting a crashed evaluation; seeds alone pair episodes)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -69,7 +88,11 @@ def main():
         )
         tag = "adaptive" if mode == "adaptive" else f"fixed_{interval:g}s"
         path = Path(args.metrics_dir) / f"RoboCasa-{args.task_name}-{tag}.jsonl"
+        done = finished_episodes(path) if args.resume else {}
         for episode in range(args.num_episodes):
+            if args.seed + episode in done:
+                records.append(done[args.seed + episode])
+                continue
             record = runner.run_episode(env, seed=args.seed + episode, max_steps=max_steps)
             record.update(
                 bench_name="RoboCasa", task_name=args.task_name, split=args.split,

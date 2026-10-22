@@ -61,14 +61,20 @@ class AdaSpeVLAPolicy(nn.Module):
         proprio_std=None,
         augment=False,
         vision_finetune_layers=0,
+        vlm_finetune_layers=0,
         vlm_mode="joint",
         vlm_dtype="auto",
         image_fit="crop",
         vlm_layers=None,
+        timing_loss="log_mse",
     ):
         super().__init__()
         if knot_supervision not in ("kl", "position"):
             raise ValueError("knot_supervision must be 'kl' or 'position'")
+        if timing_loss not in ("log_mse", "log_l1"):
+            raise ValueError("timing_loss must be 'log_mse' or 'log_l1'")
+        # Squared error fits the mean log interval, absolute error the median.
+        self.timing_loss = timing_loss
         if not flow_loss_coeff > 0:
             raise ValueError("flow_loss_coeff must be positive")
         # Table 1 loss weights (alpha, gamma) = (knot, flow); the gripper width is
@@ -151,16 +157,21 @@ class AdaSpeVLAPolicy(nn.Module):
             self.config["knot_supervision"] = self.knot_supervision
         if self.uniform_knots:
             self.config["uniform_knots"] = True
+        if self.timing_loss != "log_mse":
+            self.config["timing_loss"] = self.timing_loss
         # Observation upgrades (patch-token memory, robot state, vision fine-tuning).
         if vision_finetune_layers and not spatial_tokens:
             raise ValueError("vision_finetune_layers requires spatial_tokens")
         self.spatial_tokens = bool(spatial_tokens)
         self.proprio_dim = int(proprio_dim)
         self.vision_finetune_layers = int(vision_finetune_layers)
+        self.vlm_finetune_layers = int(vlm_finetune_layers)
         if self.spatial_tokens:
             self.config.update(spatial_tokens=True, augment=bool(augment))
         if self.vision_finetune_layers:
             self.config["vision_finetune_layers"] = self.vision_finetune_layers
+        if self.vlm_finetune_layers:
+            self.config["vlm_finetune_layers"] = self.vlm_finetune_layers
         if vla_backbone_key(vlm_name) is not None and not test_mode:
             # pi0 / pi0.5 / GR00T encoder: how images and text meet, and its dtype.
             self.config.update(vlm_mode=vlm_mode, vlm_dtype=vlm_dtype)
@@ -201,6 +212,7 @@ class AdaSpeVLAPolicy(nn.Module):
             vlm_dtype=vlm_dtype,
             image_fit=image_fit,
             vlm_layers=vlm_layers,
+            vlm_finetune_layers=self.vlm_finetune_layers,
         )
         self.knot_head = LearnableKnotPlacementHead(
             cond_dim,
@@ -238,11 +250,11 @@ class AdaSpeVLAPolicy(nn.Module):
 
     def set_training_stage(self, stage):
         """``action`` (frozen vision), ``finetune`` (action loss, last vision blocks
-        trainable) or ``timing`` (query-interval head only)."""
+        and/or language-model layers trainable) or ``timing`` (query-interval head only)."""
         if stage not in ("action", "finetune", "timing"):
             raise ValueError("Training stage must be action, finetune or timing")
-        if stage == "finetune" and not self.vision_finetune_layers:
-            raise ValueError("The finetune stage needs vision_finetune_layers > 0")
+        if stage == "finetune" and not (self.vision_finetune_layers or self.vlm_finetune_layers):
+            raise ValueError("The finetune stage needs vision_finetune_layers or vlm_finetune_layers > 0")
         self.zero_grad(set_to_none=True)
         self.training_stage = stage
         for name, parameter in self.named_parameters():
@@ -257,9 +269,11 @@ class AdaSpeVLAPolicy(nn.Module):
                 if name.startswith(("vision_encoder.", "text_encoder.")):
                     parameter.requires_grad_(False)
             if stage == "finetune":
-                self.vlm.set_trainable_vision_layers(self.vision_finetune_layers)
+                self.vlm.set_trainable_vision_layers(
+                    self.vision_finetune_layers, lm=bool(self.vlm_finetune_layers)
+                )
             else:
-                self.vlm.trainable_vision_layers = 0
+                self.vlm.trainable_vision_layers, self.vlm.trainable_lm = 0, False
         self.train(self.training)
 
     def checkpoint_state_dict(self):
@@ -358,7 +372,10 @@ class AdaSpeVLAPolicy(nn.Module):
             or (target <= 0).any()
         ):
             raise ValueError("Invalid target query interval")
-        loss = F.mse_loss(interval.log(), target.log())
+        if self.timing_loss == "log_l1":
+            loss = F.l1_loss(interval.log(), target.log())
+        else:
+            loss = F.mse_loss(interval.log(), target.log())
         return loss, {
             "total_loss": loss.item(),
             "frequency_loss": loss.item(),
