@@ -17,7 +17,9 @@ All commands run from the repository root unless a step says otherwise.
 | Train on a native RoboTwin HDF5 export (right arm) | [Step 3](#step-3-train-on-native-robotwin-hdf5-right-arm), [docs/robotwin_native.md](docs/robotwin_native.md) |
 | Train on HDF5 data I already converted | [Step 4](#step-4-train-on-already-converted-hdf5-data) |
 | Use the vision-language encoder of pi0, pi0.5 or GR00T instead of SigLIP | [Step 5](#step-5-choose-the-backbone) |
+| See the latest results and the best recipe so far | [results_20261022.md](results_20261022.md) |
 | Reproduce the benchmark training recipe, see why it is set that way and what is being tested | [training_recipe.md](training_recipe.md) |
+| Add RoboTwin demos stored as joint states (DDA-VLA collections) | [Step 4](#add-robotwin-demos-stored-as-joint-states) |
 | Look up a training option | [Training options](#training-options-all-training-scripts) |
 | Train and evaluate the RoboTwin / RoboCasa suite on Jean Zay (Slurm) | [Quick start on Jean Zay](#quick-start-on-jean-zay), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
 | Train and evaluate on RoboTwin 2.0 through XPolicyLab | [docs/benchmarks.md, Part A](docs/benchmarks.md#part-a-robotwin-20-through-the-xpolicylab-adapter) |
@@ -42,21 +44,46 @@ cp suite_train.slurm my_train.slurm && sbatch my_train.slurm
 sbatch my_eval_robotwin.slurm
 # 3. Summarize success rate, queries and timing per mode
 python -m scripts.benchmarks.summarize_metrics eval_metrics/<run>/robotwin/<task>/demo_clean
+# 4. RoboCasa: compare runs episode by episode (per-task table, paired wins/losses,
+#    exact McNemar p); each root holds <task>/RoboCasa-<task>-<mode>.jsonl
+python -m scripts.benchmarks.compare_runs --run A eval_metrics/<runA>/robocasa \
+    --run B eval_metrics/<runB>/robocasa --pair A:adaptive B:adaptive --pair A:adaptive A:fixed_0.4s
 ```
 
 The recipe these files run, with the evidence for each setting and its known
-problems, is in [training_recipe.md](training_recipe.md).
+problems, is in [training_recipe.md](training_recipe.md); the latest results
+are in [results_20261022.md](results_20261022.md).
+
+**Best recipe so far (2026-10-22)**:
+- *Both benchmarks*: frozen pi0.5 encoder with the whole frame letterboxed (`--image_fit pad`) and only its first 6 Gemma layers (`--vlm_layers 6`).
+- *RoboCasa*: add 24-sample windows with query intervals of 0.2–0.8 s: `--chunk_horizon 24 --num_control_points 11 --min_query_interval 0.2 --max_query_interval 0.8`. Run it with `robocasa_win24.slurm` (variant `win24`); it reaches 54.9% adaptive over 9 tasks.
+- *RoboTwin*: train on 110 demos per task with `robotwin_d110.slurm` (variant `d110`).
 
 | File | What it runs |
 |---|---|
-| `suite_train.slurm` | **Current recipe**: pi0.5 encoder (frozen, joint), robot state, no augmentation, padded episode ends; 8 RoboTwin and 8 RoboCasa tasks on H100 (OpenDrawer: `suite_train_opendrawer.slurm`) |
+| `suite_train.slurm` | Baseline recipe of 2026-10-18: pi0.5 encoder (frozen, joint), robot state, no augmentation, padded episode ends, center crop; 8 RoboTwin and 8 RoboCasa tasks on H100 (OpenDrawer: `suite_train_opendrawer.slurm`) |
 | `suite_eval_robotwin.slurm`, `suite_eval_robocasa.slurm` | Evaluation of the suite: RoboTwin `demo_clean` in 4 shards of 25 episodes, RoboCasa 50 episodes; adaptive and fixed query intervals (H100) |
+| `robocasa_win24.slurm` | **Best RoboCasa recipe** (`win24`) and a timing-only variant (`mid6-floor`) on all 9 RoboCasa tasks. Each job trains, then evaluates adaptive, fixed 0.2 s and fixed 0.4 s |
+| `robocasa_mid6_train.slurm`, `robocasa_mid6_eval.slurm` | pad-mid6 (`--image_fit pad --vlm_layers 6`) on the 9 RoboCasa tasks |
+| `robocasa_policy_pilot.slurm` | Policy variants on 4 RoboCasa tasks, one array index per variant and task (the header lists the indices):<br>• larger action expert, augmentation, encoder fine-tuning<br>• these changes combined with win24<br>• 32-sample windows (`win32`)<br>• win24 with the GR00T encoder |
+| `robocasa_win24_eval.slurm` | Catch-up RoboCasa evaluation on 4 A100s for an explicit list of evaluations (`EVALS`); partial ones resume at their next seed. Then writes a summary table |
+| `timing_pilot_train.slurm`, `timing_pilot_eval_robocasa.slurm` | Timing-head-only retrains on existing action checkpoints (interval floor, median loss) |
+| `convert_dda_robotwin.slurm` | Builds `data/converted/robotwin-d110`: the 50 official demos plus 60 DDA-VLA demos per suite task |
+| `robotwin_d110.slurm` | **Best RoboTwin recipe** (`d110`: pad-mid6 on 110 demos), with augmented, larger-expert and 24-sample-window variants. Later indices evaluate one shard per job |
 | `recipe_pilot_*.slurm` | Recipe pilot: no robot state, twice the action steps (four dev tasks) |
 | `crop_pilot_*.slurm` | Crop-fix pilot: whole-frame images, trimmed idle rows, Gemma layer-6 readout (four RoboTwin tasks, two runs each) |
 | `backbone_train.slurm`, `backbone_eval_*.slurm` | Backbone comparison: SigLIP, pi0, pi0.5, GR00T on four dev tasks |
 | `run.slurm` | Basic training with epoch defaults (H100); add `#SBATCH --array=<task rows>` before use |
 | `eval.slurm`, `eval_robotwin.slurm` | Generic simulator evaluation, RoboCasa / sharded RoboTwin (H100) |
 | `bench_v100.slurm`, `bench_backbones_a100.slurm` | Speed and memory measurements before sizing step budgets |
+
+Practical notes for these files (details in [training_recipe.md](training_recipe.md)):
+
+- **RoboCasa evaluations sometimes abort**: `SIGABRT` in robosuite's `read_pixels` while stepping, in about 30% of 1-GPU H100 jobs, and on every attempt on some nodes. The cause is unknown.
+  - The evaluation files retry three times with `--resume` (`eval_robocasa_closed_loop` skips finished seeds).
+  - `robocasa_policy_pilot.slurm` excludes the worst nodes.
+  - Anything still unfinished goes into the `EVALS` list of `robocasa_win24_eval.slurm`, which has finished every evaluation given to it so far.
+- **Run RoboTwin evaluations one shard per job.** Four shards sharing one GPU and 24 cores run about 4× slower each.
 
 ---
 
@@ -229,6 +256,37 @@ Data from RoboTwin 2.0, RoboDojo or RoboCasa365 should go through the benchmark
 converters in [docs/benchmarks.md](docs/benchmarks.md) instead, which write this
 contract for you.
 
+### Add RoboTwin demos stored as joint states
+
+The DDA-VLA RoboTwin collections (`$SCRATCH/dda_vla/robotwin_pairs_x60` and its
+`_h<k>` helpers) store `.pt` episodes with per-frame joint states and three
+224×224 views. For each frame, `scripts.benchmarks.convert_dda_robotwin`:
+
+- computes both end-effector poses with SAPIEN forward kinematics, as RoboTwin's
+  own `get_<arm>_ee_pose` does. On official demos this reproduces the stored poses
+  with a median error of 0 mm and a maximum of 3.6 mm;
+- sets the gripper width to the width commanded at the previous frame;
+- resizes the views back to 320×240.
+
+It needs the RoboTwin environment (SAPIEN) and numbers its episodes from
+`--start_index`, so they can sit next to an official conversion:
+
+```bash
+python -m scripts.benchmarks.convert_dda_robotwin --task_name beat_block_hammer \
+    --source_root $SCRATCH/dda_vla/robotwin_pairs_x60 --output_dir data/converted/robotwin-d110 \
+    --start_index 50 --max_episodes 60
+```
+
+`convert_dda_robotwin.slurm` builds `data/converted/robotwin-d110` for the 8 suite
+tasks:
+
+- episodes 0–49 are symlinks to the official conversion;
+- episodes 50–109 are DDA demos on seeds 1000+. DDA's 40 demos on seeds 0–67 are
+  left out, since they may repeat the official scenes.
+
+The DDA renders are darker than the evaluation's, and their wrist views clip the
+near gripper fingers. Augmentation was tried to bridge this gap and did not help.
+
 ## Step 5: Choose the backbone
 
 `--vlm_name` selects the vision **and** language encoder. Every training script
@@ -243,11 +301,19 @@ flag.
 | `gr00t` | SigLIP-So400m/14 of GR00T N1.5 (Eagle 2.5) | First 12 Qwen3-1.7B layers of GR00T N1.5 | 1.3B | 0.56 | 7.3 GB |
 
 Speeds are from `bench_backbones_a100.slurm` (job 1135286; patch tokens and
-robot state, no finetune stage). `pi05` is the default: it had the best mean success in the
-backbone comparison (`backbone-cmp-20261016-pad`, frozen encoders, adaptive timing:
-pi0.5 34%, GR00T 29%, SigLIP-B 27%, pi0 21% over beat_block_hammer, press_stapler,
-CloseFridge and SlideDishwasherRack). The trainable action head has 24M parameters
-with SigLIP-B and 28M with the others.
+robot state, no finetune stage). `pi05` is the default.
+
+- **Why pi0.5:** it had the best mean success in the backbone comparison
+  (`backbone-cmp-20261016-pad`, frozen encoders, center crop, adaptive timing):
+  pi0.5 34%, GR00T 29%, SigLIP-B 27%, pi0 21% over beat_block_hammer,
+  press_stapler, CloseFridge and SlideDishwasherRack.
+- **Pass `--image_fit pad --vlm_layers 6` with it.** Letterboxing the whole frame
+  and reading Gemma layer 6 instead of the last layer lifted RoboCasa from 34.2%
+  to 44.0% and roughly tripled RoboTwin success.
+- **GR00T under the current recipe** (`robocasa_policy_pilot.slurm`, variant
+  `win24-gr00t`) is being tested.
+- **Action head size:** 24M trainable parameters with SigLIP-B, 28M with the
+  others (`--flow_hidden_dim 384`).
 
 ```bash
 # pi0 encoder, images and instruction through Gemma together (default joint mode)
@@ -270,7 +336,9 @@ For `pi0`, `pi05` and `gr00t`:
   H100, and in float32 on V100, which has no bfloat16 and is much slower here.
   Train these backbones on A100 or H100.
 - `--vision_finetune_layers N` trains the last N blocks of their vision encoder
-  in the `finetune` stage, as for SigLIP; the language model stays frozen.
+  in the `finetune` stage, as for SigLIP.
+- `--vlm_finetune_layers N` also trains the last N kept language-model layers in
+  that stage, in float32. Otherwise the language model stays frozen.
 
 How each backbone is built and loaded: [Backbones](#backbones).
 
@@ -281,9 +349,13 @@ Defaults train the full model: patch-token memory, robot state, and a
 reproduce the earlier pooled-feature model, pass
 `--no-spatial_tokens --no-proprio --vision_finetune_layers 0`.
 
-The benchmark recipe differs from these defaults (no finetune stage, padded
-episode ends, batch 32, fixed step budgets); its exact flags are in
-[training_recipe.md](training_recipe.md).
+The benchmark recipe differs from these defaults in several ways:
+
+- no finetune stage, padded episode ends, batch 32, fixed step budgets;
+- the best version so far adds `--image_fit pad --vlm_layers 6`;
+- on RoboCasa, it also adds `--chunk_horizon 24 --num_control_points 11 --min_query_interval 0.2 --max_query_interval 0.8`.
+
+Its exact flags are in [training_recipe.md](training_recipe.md).
 
 **Stages and optimization**
 
@@ -307,20 +379,22 @@ episode ends, batch 32, fixed step budgets); its exact flags are in
 | `--vlm_name` | `pi05` | Vision-language encoder: a Hugging Face SigLIP model, or `pi0`, `pi05`, `gr00t` ([Step 5](#step-5-choose-the-backbone)) |
 | `--vlm_mode` | `joint` | `pi0`/`pi05`/`gr00t`: images and instruction through the language model together (`joint`) or the instruction alone (`separate`) |
 | `--vlm_dtype` | `auto` | `pi0`/`pi05`/`gr00t` language model: `auto` = bfloat16 on Ampere or newer, else float32; or `bfloat16`, `float16`, `float32` |
-| `--vlm_layers` | all | `pi0`/`pi05`/`gr00t`: run only the first N language-model layers and read their final-norm output |
-| `--image_fit` | `crop` | `crop`: centred square of 90% of the short side (drops the sides of 4:3 frames such as RoboTwin's 320x240); `pad`: letterbox the whole frame to a square, as pi0 does (needs `--no-augment`) |
+| `--vlm_layers` | all | `pi0`/`pi05`/`gr00t`: run only the first N language-model layers and read their final-norm output (best so far: 6) |
+| `--image_fit` | `crop` | `crop`: centred square of 90% of the short side (drops the sides of 4:3 frames such as RoboTwin's 320x240); `pad`: letterbox the whole frame to a square, as pi0 does (best so far) |
 | `--spatial_tokens` / `--no-spatial_tokens` | on | The flow cross-attends to all patch tokens of every view; off = one pooled feature vector |
 | `--proprio` / `--no-proprio` | on | Condition on robot state: base-frame end-effector position, 6-D rotation and last gripper command, per arm |
-| `--augment` / `--no-augment` | off | Random 90% crop and ±20% colour jitter while training (spatial mode); evaluation uses a centre crop |
-| `--vision_finetune_layers` | 4 | Vision blocks trained in the `finetune` stage; 0 skips the stage (needs spatial mode) |
-| `--vision_lr_scale` | 0.1 | Learning-rate multiplier for those vision blocks |
+| `--augment` / `--no-augment` | off | Colour jitter (±20%) while training (spatial mode), plus a random 90% crop with `--image_fit crop` or a random shift of up to 5% of the side (replicate padding) with `pad`. Evaluation is deterministic |
+| `--vision_finetune_layers` | 4 | Vision blocks trained in the `finetune` stage; 0 skips the stage unless `--vlm_finetune_layers` is set (needs spatial mode) |
+| `--vlm_finetune_layers` | 0 | `pi0`/`pi05`/`gr00t`: last N kept language-model layers (plus the final norm) also trained in the `finetune` stage, held in float32 |
+| `--vision_lr_scale` | 0.1 | Learning-rate multiplier for the fine-tuned encoder blocks and layers |
 | `--test_backbone` | off | Tiny offline backbone, for tests only |
 
 **Spline, losses and timing**
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--num_control_points`, `--degree` | 8, 3 | B-spline size |
+| `--num_control_points`, `--degree` | 8, 3 | B-spline size. Scale the control points with the window to keep ~0.14 s per knot span: 8 for 16 samples, 11 for 24, 14 for 32 |
+| `--flow_hidden_dim`, `--flow_num_layers`, `--flow_num_heads` | 384, 6, 6 | Action expert size (~28M parameters). 768/12/12 (~165M) and 1024/16/16 (~390M) gave no significant gain on RoboCasa |
 | `--num_ode_steps` | 15 | Flow-matching integration steps, stored in the checkpoint |
 | `--knot_loss_coeff` / `--flow_loss_coeff` | 0.5 / 1 | Loss weights alpha, gamma (Table 1); the gripper is a flow channel |
 | `--gripper_density_gain` | 10 | beta_g, gripper-width variation weight in the knot density |
@@ -328,12 +402,15 @@ episode ends, batch 32, fixed step budgets); its exact flags are in
 | `--knot_supervision` | `kl` | `kl` (span KL) or `position` (L_pos ablation) |
 | `--uniform_knots` | off | Ablation: fixed uniform knots instead of learned knots |
 | `--per_arm_knots` | off | Ablation for two-arm data: one knot partition per arm |
+| `--min_query_interval`, `--max_query_interval` | 0.02, 0.5 | Range of the query interval (s) the timing head predicts and is trained on. The cap must fit inside the window. Best on RoboCasa so far: 0.2, 0.8 with `--chunk_horizon 24` |
+| `--timing_loss` | `log_mse` | Timing-head loss on log intervals: `log_mse` fits the mean, `log_l1` the median (which can collapse onto the cap) |
+| `--event_quantile` | 0.95 | Quantile of the acceleration term over the training windows that sets the event threshold `e_crit` of the timing teacher |
 
 **Training windows**
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--chunk_horizon` | 16 | Window length in samples, when `--supported_horizons` is not set |
+| `--chunk_horizon` | 16 | Window length in samples, when `--supported_horizons` is not set. This is the trajectory one query predicts: 16 = 0.75 s on RoboCasa (0.05 s samples) and 0.9 s on RoboTwin (0.06 s); 24 (1.15 s) is the best on RoboCasa so far |
 | `--supported_horizons 0.1 0.3` | off | Timestamped windows with horizons in this range (seconds) |
 | `--horizon_duration` | median window | Inference horizon in seconds, inside training support |
 | `--control_dt` | 0.02 | Shortest allowed window, in seconds |
@@ -436,14 +513,18 @@ per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
 5. The optional `finetune` stage keeps the action loss and also trains the last
    `--vision_finetune_layers` blocks of the vision encoder (plus its final layer
    norm, and the SigLIP head or the pi0/GR00T projector) at
-   `lr × --vision_lr_scale`. The text encoder or language model stays frozen.
+   `lr × --vision_lr_scale`. The text encoder or language model stays frozen,
+   except for the last `--vlm_finetune_layers` kept layers, which train at the
+   same rate in float32.
    Every stage has its own AdamW, warmup + cosine schedule and gradient
-   clipping at 1.0.
+   clipping at 1.0. A step whose gradient norm is not finite is skipped and
+   logged ("batch skipped") instead of turning every weight into NaN.
 6. The `timing` stage freezes the whole action predictor (including the
    backbone), generates control points using the inference flow solver, and
    trains only `policy.freq_head`. Inputs are context, log horizon, detached
    spans, and probes of the planned motion and clamped width. The loss is
-   log-MSE on query intervals.
+   log-MSE on query intervals (`--timing_loss log_l1` for absolute error), and
+   predictions are clamped to `[--min_query_interval, --max_query_interval]`.
 7. Measured valid intervals override the fallback teacher. Fallback events at
    sample indices `j >= 1` are acceleration magnitude `e_{j-1} >= e_crit`, any
    arm's width crossing `theta_g = 0.5`, or criticality `>= 0.5`. The target is
@@ -458,8 +539,10 @@ resized to the encoder's input size and normalized as that encoder expects.
 On non-square frames this drops the sides: for RoboTwin's 320×240 cameras the
 model sees only the central 216×216, and objects near the table edges are out
 of view. `--image_fit pad` instead letterboxes the whole frame to a square with
-black bars before resizing, as pi0 does (no random-crop augmentation in this
-mode). The choice is saved in the checkpoint; older checkpoints keep the crop.
+black bars before resizing, as pi0 does. With `--augment`, the training images
+are shifted at random by up to 5% of the side, using replicate padding, instead
+of being randomly cropped. The choice is saved in the checkpoint; older
+checkpoints keep the crop.
 Model-loading failures propagate; the offline test backbone is selected only by
 `--test_backbone`.
 
@@ -509,7 +592,8 @@ ends, and it is the file evaluation needs.
 Pretrained backbone weights that were never trained are left out of
 `model_state`: they equal the pretrained files, which the policy loads when it
 is built (so those files must be in the Hugging Face cache wherever the
-checkpoint is evaluated). Fine-tuned vision blocks are saved. A checkpoint is
+checkpoint is evaluated). Fine-tuned vision blocks and language-model layers
+are saved; the latter are rebuilt in float32 from the config. A checkpoint is
 about 100 MB plus the fine-tuned blocks (about 30 MB per SigLIP-B block, 60 MB
 per So400m block); before this, SigLIP checkpoints were 0.9 GB. Loading is strict except for those keys, so older
 checkpoints that contain every weight still load. Checkpoints trained before
