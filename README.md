@@ -1,687 +1,146 @@
-# AdaSpeVLA: Adaptive Knot Placement and Supervised Query Timing
+# AdaSpeVLA 真机训练代码
 
-AdaSpeVLA predicts one continuous spline per call from camera images and a
-language instruction. Per arm it holds six base-frame offsets from the
-end-effector pose observed at query time and the gripper opening width, all
-generated jointly by one flow on shared learned knots. It alternates policy
-calls with spline-prefix execution: longer query intervals execute more actions
-between predictions, shorter intervals refresh sooner.
+整理日期：2026-11-10。
+用途：在 **insert-tube** 和 **wipe-whiteboard** 两个任务上训练 AdaSpeVLA，并和各自的 π0.5 基线做对照。
 
-All commands run from the repository root unless a step says otherwise.
+不包含：检查点、数据集、模型权重、HF token / SSH key 等任何凭证。
 
-## Where to start
+## 目录
 
-| I want to... | Go to |
+| 路径 | 内容 |
 |---|---|
-| Install AdaSpeVLA and check it works | [Step 1](#step-1-install), [Step 2](#step-2-check-the-installation) |
-| Train on a native RoboTwin HDF5 export (right arm) | [Step 3](#step-3-train-on-native-robotwin-hdf5-right-arm), [docs/robotwin_native.md](docs/robotwin_native.md) |
-| Train on HDF5 data I already converted | [Step 4](#step-4-train-on-already-converted-hdf5-data) |
-| Use the vision-language encoder of pi0, pi0.5 or GR00T instead of SigLIP | [Step 5](#step-5-choose-the-backbone) |
-| See the latest results and the best recipe so far | [results_20261022.md](results_20261022.md) |
-| Reproduce the benchmark training recipe, see why it is set that way and what is being tested | [training_recipe.md](training_recipe.md) |
-| Add RoboTwin demos stored as joint states (DDA-VLA collections) | [Step 4](#add-robotwin-demos-stored-as-joint-states) |
-| Look up a training option | [Training options](#training-options-all-training-scripts) |
-| Train and evaluate the RoboTwin / RoboCasa suite on Jean Zay (Slurm) | [Quick start on Jean Zay](#quick-start-on-jean-zay), [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md) |
-| Train and evaluate on RoboTwin 2.0 through XPolicyLab | [docs/benchmarks.md, Part A](docs/benchmarks.md#part-a-robotwin-20-through-the-xpolicylab-adapter) |
-| Train and evaluate on RoboDojo | [docs/benchmarks.md, Part B](docs/benchmarks.md#part-b-robodojo-through-the-same-adapter) |
-| Train and evaluate on RoboCasa365 | [docs/benchmarks.md, Part C](docs/benchmarks.md#part-c-robocasa365) |
-| Run the shared vs per-arm knot ablation | [docs/benchmarks.md, Part D](docs/benchmarks.md#part-d-bimanual-knot-ablation-shared-vs-per-arm-knots) |
-| Split demos into difficulty-adaptive spline segments | [Segment demonstrations](#segment-demonstrations-into-adaptive-action-chunks), [result.md](result.md) |
-| Run the policy on my own robot | [Using the policy in your own control loop](#using-the-policy-in-your-own-control-loop) |
-
-## Quick start on Jean Zay
-
-Training and evaluation run as self-contained `.slurm` files submitted with a
-plain `sbatch <file>.slurm`; each file sets its account, GPU type, task rows
-and flags itself. The full workflow, hardware and memory settings, and how to
-read the results are in [docs/slurm_benchmarks.md](docs/slurm_benchmarks.md).
-
-```bash
-# 1. Train: copy the suite training file, set its RUN_ROOT, #SBATCH --array (task rows) and flags
-cp suite_train.slurm my_train.slurm && sbatch my_train.slurm
-# 2. Evaluate in simulation: copy suite_eval_robotwin.slurm or suite_eval_robocasa.slurm,
-#    point RUN_ROOT/METRICS_ROOT at the run, set #SBATCH --dependency=afterany:<train job>
-sbatch my_eval_robotwin.slurm
-# 3. Summarize success rate, queries and timing per mode
-python -m scripts.benchmarks.summarize_metrics eval_metrics/<run>/robotwin/<task>/demo_clean
-# 4. RoboCasa: compare runs episode by episode (per-task table, paired wins/losses,
-#    exact McNemar p); each root holds <task>/RoboCasa-<task>-<mode>.jsonl
-python -m scripts.benchmarks.compare_runs --run A eval_metrics/<runA>/robocasa \
-    --run B eval_metrics/<runB>/robocasa --pair A:adaptive B:adaptive --pair A:adaptive A:fixed_0.4s
-```
-
-The recipe these files run, with the evidence for each setting and its known
-problems, is in [training_recipe.md](training_recipe.md); the latest results
-are in [results_20261022.md](results_20261022.md).
-
-**Best recipe so far (2026-10-22)**:
-- *Both benchmarks*: frozen pi0.5 encoder with the whole frame letterboxed (`--image_fit pad`) and only its first 6 Gemma layers (`--vlm_layers 6`).
-- *RoboCasa*: add 24-sample windows with query intervals of 0.2–0.8 s: `--chunk_horizon 24 --num_control_points 11 --min_query_interval 0.2 --max_query_interval 0.8`. Run it with `robocasa_win24.slurm` (variant `win24`); it reaches 54.9% adaptive over 9 tasks.
-- *RoboTwin*: train on 110 demos per task with `robotwin_d110.slurm` (variant `d110`).
-
-| File | What it runs |
-|---|---|
-| `suite_train.slurm` | Baseline recipe of 2026-10-18: pi0.5 encoder (frozen, joint), robot state, no augmentation, padded episode ends, center crop; 8 RoboTwin and 8 RoboCasa tasks on H100 (OpenDrawer: `suite_train_opendrawer.slurm`) |
-| `suite_eval_robotwin.slurm`, `suite_eval_robocasa.slurm` | Evaluation of the suite: RoboTwin `demo_clean` in 4 shards of 25 episodes, RoboCasa 50 episodes; adaptive and fixed query intervals (H100) |
-| `robocasa_win24.slurm` | **Best RoboCasa recipe** (`win24`) and a timing-only variant (`mid6-floor`) on all 9 RoboCasa tasks. Each job trains, then evaluates adaptive, fixed 0.2 s and fixed 0.4 s |
-| `robocasa_mid6_train.slurm`, `robocasa_mid6_eval.slurm` | pad-mid6 (`--image_fit pad --vlm_layers 6`) on the 9 RoboCasa tasks |
-| `robocasa_policy_pilot.slurm` | Policy variants on 4 RoboCasa tasks, one array index per variant and task (the header lists the indices):<br>• larger action expert, augmentation, encoder fine-tuning<br>• these changes combined with win24<br>• 32-sample windows (`win32`)<br>• win24 with the GR00T encoder |
-| `robocasa_win24_eval.slurm` | Catch-up RoboCasa evaluation on 4 A100s for an explicit list of evaluations (`EVALS`); partial ones resume at their next seed. Then writes a summary table |
-| `timing_pilot_train.slurm`, `timing_pilot_eval_robocasa.slurm` | Timing-head-only retrains on existing action checkpoints (interval floor, median loss) |
-| `convert_dda_robotwin.slurm` | Builds `data/converted/robotwin-d110`: the 50 official demos plus 60 DDA-VLA demos per suite task |
-| `robotwin_d110.slurm` | **Best RoboTwin recipe** (`d110`: pad-mid6 on 110 demos), with augmented, larger-expert and 24-sample-window variants. Later indices evaluate one shard per job |
-| `recipe_pilot_*.slurm` | Recipe pilot: no robot state, twice the action steps (four dev tasks) |
-| `crop_pilot_*.slurm` | Crop-fix pilot: whole-frame images, trimmed idle rows, Gemma layer-6 readout (four RoboTwin tasks, two runs each) |
-| `backbone_train.slurm`, `backbone_eval_*.slurm` | Backbone comparison: SigLIP, pi0, pi0.5, GR00T on four dev tasks |
-| `run.slurm` | Basic training with epoch defaults (H100); add `#SBATCH --array=<task rows>` before use |
-| `eval.slurm`, `eval_robotwin.slurm` | Generic simulator evaluation, RoboCasa / sharded RoboTwin (H100) |
-| `bench_v100.slurm`, `bench_backbones_a100.slurm` | Speed and memory measurements before sizing step budgets |
-
-Practical notes for these files (details in [training_recipe.md](training_recipe.md)):
-
-- **RoboCasa evaluations sometimes abort**: `SIGABRT` in robosuite's `read_pixels` while stepping, in about 30% of 1-GPU H100 jobs, and on every attempt on some nodes. The cause is unknown.
-  - The evaluation files retry three times with `--resume` (`eval_robocasa_closed_loop` skips finished seeds).
-  - `robocasa_policy_pilot.slurm` excludes the worst nodes.
-  - Anything still unfinished goes into the `EVALS` list of `robocasa_win24_eval.slurm`, which has finished every evaluation given to it so far.
-- **Run RoboTwin evaluations one shard per job.** Four shards sharing one GPU and 24 cores run about 4× slower each.
-
----
-
-## Step 1: Install
-
-Requirements: Linux, Python 3.10 or newer, and a CUDA GPU for real training
-(CPU is enough for the smoke test).
-
-```bash
-# 1. Create and activate an environment
-conda create -n adaspevla python=3.10 -y
-conda activate adaspevla
-
-# 2. Install PyTorch for your CUDA version first (example: CUDA 12.4)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-
-# 3. Install AdaSpeVLA (editable) with the test tools
-cd /path/to/AdaSpeVLA
-pip install -e ".[dev]"
-```
-
-### Pretrained backbones
-
-The backbone is the frozen vision-language encoder that turns camera images and
-the instruction into features ([Step 5](#step-5-choose-the-backbone)). Weights
-download from Hugging Face on first use. On a machine without internet access
-(Jean Zay compute nodes), download them once on a connected machine that shares
-the same `HF_HOME`, then set `HF_HUB_OFFLINE=1` (the Slurm files already do).
-
-| `--vlm_name` | Download | Size |
-|---|---|---|
-| `google/siglip-base-patch16-224` | `python -c "from transformers import AutoModel, AutoProcessor as P; m='google/siglip-base-patch16-224'; AutoModel.from_pretrained(m); P.from_pretrained(m)"` | 0.8 GB |
-| `pi0` | `python -c "from huggingface_hub import snapshot_download as d; d('lerobot/pi0_base', allow_patterns=['*.safetensors', 'config.json'])"` | 14 GB |
-| `pi05` (default) | `python -c "from huggingface_hub import snapshot_download as d; d('lerobot/pi05_base', allow_patterns=['*.safetensors', 'config.json'])"` | 14 GB |
-| `gr00t` | `python -c "from huggingface_hub import snapshot_download as d; d('nvidia/GR00T-N1.5-3B', allow_patterns=['*.safetensors', 'config.json'])"` | 5 GB |
-
-`pi0` and `pi05` also need the PaliGemma tokenizer, which is gated: accept its
-license on Hugging Face, log in (`huggingface-cli login`), then run
-`python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('google/paligemma-3b-pt-224')"`.
-The Eagle tokenizer of `gr00t` ships with the repository. On Jean Zay all four
-are already in `$HOME/.cache/huggingface`.
-
-## Step 2: Check the installation
-
-```bash
-# 1. Unit and integration tests (CPU). On Jean Zay, use the training interpreter,
-#    cap the threads (otherwise the run takes ~50 min on a login node), skip the
-#    user-site TensorFlow (it breaks the transformers import) and write no caches
-#    (WORK has a file quota):
-USE_TF=0 OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONDONTWRITEBYTECODE=1 \
-    tmp/train-env/bin/python -m pytest tests -q -p no:cacheprovider --continue-on-collection-errors
-
-# 2. End-to-end smoke run: synthetic data, tiny offline backbone, CPU
-python -m scripts.train_robotwin --synthetic_data --test_backbone --no-proprio \
-    --epochs 1 --timing_epochs 1 --num_ode_steps 2 --batch_size 2 \
-    --device cpu --output_dir /tmp/adaspevla-smoke
-python -m scripts.eval_robotwin \
-    --ckpt_path /tmp/adaspevla-smoke/adaspevla_robotwin_beat_block_hammer_latest.pt \
-    --num_episodes 1 --duration 0.2 --device cpu
-```
-
-Notes:
-
-- **Test status (Oct 19, 2026): not green, unchanged since Oct 15.** 70 pass and
-  26 fail; the failures predate the observation and backbone changes (for
-  example, tests that still expect a separate gripper head: 6 motion channels
-  and a `gripper_loss`; see `analysis_low_success.md`).
-  Two files, `tests/benchmarks/test_xpolicylab_benchmarks.py` and
-  `tests/benchmarks/test_per_arm_knots.py`, fail to import (`integrate_twist`
-  no longer exists in `adaspevla/benchmarks/pose_math.py`). With the thread caps
-  above the suite takes 4–9 minutes, depending on the login node; run single
-  files with `pytest tests/<file>.py` while you work.
-- The smoke run uses `--no-proprio` because the smoke evaluator doesn't supply
-  robot state yet; with robot state on it stops with "This policy conditions on
-  robot state; pass proprio". The simulator evaluators do supply it.
-- `scripts.eval_robotwin` and `scripts.eval_robocasa` are smoke evaluators: they
-  run the spline executor without a simulator, so they check that a checkpoint
-  loads and produces actions, not task success. For simulator evaluation, see
-  [docs/benchmarks.md](docs/benchmarks.md).
-
-## Step 3: Train on native RoboTwin HDF5 (right arm)
-
-Use this for the official RoboTwin state/action-paired HDF5 export. The native
-adapter reads the observed right-arm poses and the continuous commanded gripper
-width while loading; each training window re-anchors the poses at its first
-sample, so there is no separate conversion step.
-
-```bash
-# 1. Locate the episodes. The loader searches <data_dir>/<task_name>/ recursively,
-#    or else the HDF5 files directly inside <data_dir>.
-ls /path/to/robotwin/source_domain/beat_block_hammer | head
-
-# 2. Optional: list the dataset paths of one episode
-python -m scripts.inspect_hdf5 /path/to/robotwin/source_domain/beat_block_hammer/<episode>.hdf5
-
-# 3. Train all stages (action, vision finetune, query timing)
-python -m scripts.train_robotwin \
-    --data_dir /path/to/robotwin/source_domain \
-    --task_name beat_block_hammer \
-    --robotwin_native_right \
-    --epochs 10 --timing_epochs 10 --batch_size 8 \
-    --output_dir ./checkpoints/robotwin_right
-
-# 4. Check that the checkpoint loads and runs
-python -m scripts.eval_robotwin \
-    --ckpt_path ./checkpoints/robotwin_right/adaspevla_robotwin_beat_block_hammer_latest.pt \
-    --num_episodes 1
-```
-
-The output is `./checkpoints/robotwin_right/adaspevla_robotwin_<task>_latest.pt`,
-the timing-stage checkpoint that evaluation needs, plus one file per stage
-(`_action.pt`, `_finetune.pt`, `_timing.pt`).
-
-Options for this mode:
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--robotwin_base_wxyz qw qx qy qz` | `0.707 0 0 0.707` (Aloha) | Robot base orientation in world, for another embodiment |
-| `--robotwin_simulation_dt` | `1/250` | Collector timestep; sample period = `frequency` × this |
-| `--sample_dt` | from file | Override the sample period in seconds |
-| `--camera_paths A B` | head + right wrist | Override the camera datasets, in view order |
-
-Do not combine `--robotwin_native_right` with `--dual_arm`, `--actions_path` or
-manual gripper coding. Conversion details and the timing caveat are in
-[docs/robotwin_native.md](docs/robotwin_native.md).
-
-## Step 4: Train on already converted HDF5 data
-
-Use this when your HDF5 files already contain end-effector poses and gripper
-widths (or base-frame twists, which are integrated into poses) that follow the
-[action and dataset contract](#action-and-dataset-contract) below.
-
-```bash
-# RoboTwin layout (one arm; add --dual_arm for 14-channel two-arm data)
-python -m scripts.train_robotwin \
-    --data_dir /path/to/converted/data --task_name beat_block_hammer \
-    --epochs 10 --timing_epochs 10 --output_dir ./checkpoints/robotwin
-
-# RoboCasa layout
-python -m scripts.train_robocasa \
-    --data_dir /path/to/converted/data --task_name PnPCounterToCab \
-    --epochs 10 --timing_epochs 10 --output_dir ./checkpoints/robocasa
-
-# Output of the benchmark converters (docs/benchmarks.md); what the Slurm files run
-python -m scripts.benchmarks.train_converted \
-    --data_dir data/converted/robotwin --task_name beat_block_hammer \
-    --batch_size 32 --action_steps 40000 --timing_steps 10000 \
-    --output_dir ./checkpoints/my-run/robotwin/beat_block_hammer
-```
-
-If the HDF5 files carry no action metadata attributes, declare it on the command
-line, but only if it matches the source:
-
-```bash
-python -m scripts.train_robotwin --data_dir /path/to/converted/data --task_name beat_block_hammer \
-    --action_type ee_pose --action_frame base --sample_dt 0.02 \
-    --gripper_open_value 1 --gripper_closed_value 0
-```
-
-If your camera datasets have other names, inspect one episode and pass them in
-view order:
-
-```bash
-python -m scripts.inspect_hdf5 /path/to/episode.hdf5
-python -m scripts.train_robotwin --data_dir /path/to/converted/data --task_name beat_block_hammer \
-    --camera_paths observation/head_camera/rgb observation/wrist_camera/rgb
-```
-
-Data from RoboTwin 2.0, RoboDojo or RoboCasa365 should go through the benchmark
-converters in [docs/benchmarks.md](docs/benchmarks.md) instead, which write this
-contract for you.
-
-### Add RoboTwin demos stored as joint states
-
-The DDA-VLA RoboTwin collections (`$SCRATCH/dda_vla/robotwin_pairs_x60` and its
-`_h<k>` helpers) store `.pt` episodes with per-frame joint states and three
-224×224 views. For each frame, `scripts.benchmarks.convert_dda_robotwin`:
-
-- computes both end-effector poses with SAPIEN forward kinematics, as RoboTwin's
-  own `get_<arm>_ee_pose` does. On official demos this reproduces the stored poses
-  with a median error of 0 mm and a maximum of 3.6 mm;
-- sets the gripper width to the width commanded at the previous frame;
-- resizes the views back to 320×240.
-
-It needs the RoboTwin environment (SAPIEN) and numbers its episodes from
-`--start_index`, so they can sit next to an official conversion:
-
-```bash
-python -m scripts.benchmarks.convert_dda_robotwin --task_name beat_block_hammer \
-    --source_root $SCRATCH/dda_vla/robotwin_pairs_x60 --output_dir data/converted/robotwin-d110 \
-    --start_index 50 --max_episodes 60
-```
-
-`convert_dda_robotwin.slurm` builds `data/converted/robotwin-d110` for the 8 suite
-tasks:
-
-- episodes 0–49 are symlinks to the official conversion;
-- episodes 50–109 are DDA demos on seeds 1000+. DDA's 40 demos on seeds 0–67 are
-  left out, since they may repeat the official scenes.
-
-The DDA renders are darker than the evaluation's, and their wrist views clip the
-near gripper fingers. Augmentation was tried to bridge this gap and did not help.
-
-## Step 5: Choose the backbone
-
-`--vlm_name` selects the vision **and** language encoder. Every training script
-accepts it, and the choice is saved in the checkpoint, so evaluation needs no
-flag.
-
-| `--vlm_name` | Vision encoder | Language encoder | Frozen params | A100 s/step (batch 32, 3 views) | GPU memory |
-|---|---|---|---|---|---|
-| `google/siglip-base-patch16-224` | SigLIP-B/16, 224 px, 196 tokens per view | SigLIP text tower | 0.2B | 0.20 | 2.9 GB |
-| `pi0` | SigLIP-So400m/14 of pi0, 224 px, 256 tokens per view | Gemma-2B of pi0 | 2.9B | 0.86 | 12 GB |
-| `pi05` (default) | SigLIP-So400m/14 of pi0.5 | Gemma-2B of pi0.5 | 2.9B | as pi0 (same architecture) | as pi0 |
-| `gr00t` | SigLIP-So400m/14 of GR00T N1.5 (Eagle 2.5) | First 12 Qwen3-1.7B layers of GR00T N1.5 | 1.3B | 0.56 | 7.3 GB |
-
-Speeds are from `bench_backbones_a100.slurm` (job 1135286; patch tokens and
-robot state, no finetune stage). `pi05` is the default.
-
-- **Why pi0.5:** it had the best mean success in the backbone comparison
-  (`backbone-cmp-20261016-pad`, frozen encoders, center crop, adaptive timing):
-  pi0.5 34%, GR00T 29%, SigLIP-B 27%, pi0 21% over beat_block_hammer,
-  press_stapler, CloseFridge and SlideDishwasherRack.
-- **Pass `--image_fit pad --vlm_layers 6` with it.** Letterboxing the whole frame
-  and reading Gemma layer 6 instead of the last layer lifted RoboCasa from 34.2%
-  to 44.0% and roughly tripled RoboTwin success.
-- **GR00T under the current recipe** (`robocasa_policy_pilot.slurm`, variant
-  `win24-gr00t`) is being tested.
-- **Action head size:** 24M trainable parameters with SigLIP-B, 28M with the
-  others (`--flow_hidden_dim 384`).
-
-```bash
-# pi0 encoder, images and instruction through Gemma together (default joint mode)
-python -m scripts.benchmarks.train_converted \
-    --data_dir data/converted/robotwin --task_name beat_block_hammer \
-    --vlm_name pi0 --batch_size 32 --action_steps 40000 --timing_steps 10000 \
-    --output_dir ./checkpoints/pi0-run/robotwin/beat_block_hammer
-
-# GR00T encoder, instruction read by the language model alone (cheaper)
-python -m scripts.benchmarks.train_converted ... --vlm_name gr00t --vlm_mode separate
-```
-
-For `pi0`, `pi05` and `gr00t`:
-
-- `--vlm_mode joint` (default) runs the image tokens of every view and the
-  instruction through the language model together, as pi0 and GR00T do.
-  `--vlm_mode separate` uses the vision tokens directly and runs the language
-  model on the instruction alone, which costs about as much as SigLIP.
-- `--vlm_dtype auto` (default) stores the language model in bfloat16 on A100 and
-  H100, and in float32 on V100, which has no bfloat16 and is much slower here.
-  Train these backbones on A100 or H100.
-- `--vision_finetune_layers N` trains the last N blocks of their vision encoder
-  in the `finetune` stage, as for SigLIP.
-- `--vlm_finetune_layers N` also trains the last N kept language-model layers in
-  that stage, in float32. Otherwise the language model stays frozen.
-
-How each backbone is built and loaded: [Backbones](#backbones).
-
-## Training options (all training scripts)
-
-Defaults train the full model: patch-token memory, robot state, and a
-`finetune` stage for the last 4 vision blocks, without image augmentation. To
-reproduce the earlier pooled-feature model, pass
-`--no-spatial_tokens --no-proprio --vision_finetune_layers 0`.
-
-The benchmark recipe differs from these defaults in several ways:
-
-- no finetune stage, padded episode ends, batch 32, fixed step budgets;
-- the best version so far adds `--image_fit pad --vlm_layers 6`;
-- on RoboCasa, it also adds `--chunk_horizon 24 --num_control_points 11 --min_query_interval 0.2 --max_query_interval 0.8`.
-
-Its exact flags are in [training_recipe.md](training_recipe.md).
-
-**Stages and optimization**
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--epochs` | 10 | `action` stage epochs (action predictor; backbone frozen) |
-| `--finetune_epochs` | 5 | `finetune` stage epochs (action loss; last vision blocks trainable) |
-| `--timing_epochs` | 10 | `timing` stage epochs (query-timing head only) |
-| `--action_steps`, `--finetune_steps`, `--timing_steps` | off | Optimizer steps per stage; each overrides the matching epoch count |
-| `--batch_size`, `--lr` | 8, 2e-4 | Optimizer settings |
-| `--warmup_steps` | 500 | Linear warmup (at most 10% of a stage), then cosine decay |
-| `--resume` | off | Continue from the newest stage checkpoint in `--output_dir`; stage checkpoints then also store the optimizer and schedule |
-| `--stop_after_minutes` | off | Save a resumable stage checkpoint and stop after this wall time (chained short jobs; use with `--resume`) |
-| `--num_workers` | 8 | DataLoader workers |
-| `--device` | `cuda` if available | Training device |
-
-**Backbone and observations**
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--vlm_name` | `pi05` | Vision-language encoder: a Hugging Face SigLIP model, or `pi0`, `pi05`, `gr00t` ([Step 5](#step-5-choose-the-backbone)) |
-| `--vlm_mode` | `joint` | `pi0`/`pi05`/`gr00t`: images and instruction through the language model together (`joint`) or the instruction alone (`separate`) |
-| `--vlm_dtype` | `auto` | `pi0`/`pi05`/`gr00t` language model: `auto` = bfloat16 on Ampere or newer, else float32; or `bfloat16`, `float16`, `float32` |
-| `--vlm_layers` | all | `pi0`/`pi05`/`gr00t`: run only the first N language-model layers and read their final-norm output (best so far: 6) |
-| `--image_fit` | `crop` | `crop`: centred square of 90% of the short side (drops the sides of 4:3 frames such as RoboTwin's 320x240); `pad`: letterbox the whole frame to a square, as pi0 does (best so far) |
-| `--spatial_tokens` / `--no-spatial_tokens` | on | The flow cross-attends to all patch tokens of every view; off = one pooled feature vector |
-| `--proprio` / `--no-proprio` | on | Condition on robot state: base-frame end-effector position, 6-D rotation and last gripper command, per arm |
-| `--augment` / `--no-augment` | off | Colour jitter (±20%) while training (spatial mode), plus a random 90% crop with `--image_fit crop` or a random shift of up to 5% of the side (replicate padding) with `pad`. Evaluation is deterministic |
-| `--vision_finetune_layers` | 4 | Vision blocks trained in the `finetune` stage; 0 skips the stage unless `--vlm_finetune_layers` is set (needs spatial mode) |
-| `--vlm_finetune_layers` | 0 | `pi0`/`pi05`/`gr00t`: last N kept language-model layers (plus the final norm) also trained in the `finetune` stage, held in float32 |
-| `--vision_lr_scale` | 0.1 | Learning-rate multiplier for the fine-tuned encoder blocks and layers |
-| `--test_backbone` | off | Tiny offline backbone, for tests only |
-
-**Spline, losses and timing**
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--num_control_points`, `--degree` | 8, 3 | B-spline size. Scale the control points with the window to keep ~0.14 s per knot span: 8 for 16 samples, 11 for 24, 14 for 32 |
-| `--flow_hidden_dim`, `--flow_num_layers`, `--flow_num_heads` | 384, 6, 6 | Action expert size (~28M parameters). 768/12/12 (~165M) and 1024/16/16 (~390M) gave no significant gain on RoboCasa |
-| `--num_ode_steps` | 15 | Flow-matching integration steps, stored in the checkpoint |
-| `--knot_loss_coeff` / `--flow_loss_coeff` | 0.5 / 1 | Loss weights alpha, gamma (Table 1); the gripper is a flow channel |
-| `--gripper_density_gain` | 10 | beta_g, gripper-width variation weight in the knot density |
-| `--gripper_threshold` | 0.5 | theta_g, width threshold for gripper events in the timing teacher |
-| `--knot_supervision` | `kl` | `kl` (span KL) or `position` (L_pos ablation) |
-| `--uniform_knots` | off | Ablation: fixed uniform knots instead of learned knots |
-| `--per_arm_knots` | off | Ablation for two-arm data: one knot partition per arm |
-| `--min_query_interval`, `--max_query_interval` | 0.02, 0.5 | Range of the query interval (s) the timing head predicts and is trained on. The cap must fit inside the window. Best on RoboCasa so far: 0.2, 0.8 with `--chunk_horizon 24` |
-| `--timing_loss` | `log_mse` | Timing-head loss on log intervals: `log_mse` fits the mean, `log_l1` the median (which can collapse onto the cap) |
-| `--event_quantile` | 0.95 | Quantile of the acceleration term over the training windows that sets the event threshold `e_crit` of the timing teacher |
-
-**Training windows**
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--chunk_horizon` | 16 | Window length in samples, when `--supported_horizons` is not set. This is the trajectory one query predicts: 16 = 0.75 s on RoboCasa (0.05 s samples) and 0.9 s on RoboTwin (0.06 s); 24 (1.15 s) is the best on RoboCasa so far |
-| `--supported_horizons 0.1 0.3` | off | Timestamped windows with horizons in this range (seconds) |
-| `--horizon_duration` | median window | Inference horizon in seconds, inside training support |
-| `--control_dt` | 0.02 | Shortest allowed window, in seconds |
-| `--pad_episode_end` | off | Also anchor windows in the last `chunk_horizon - 1` samples, holding the final pose and width after the demo ends; without it the motion that completes the task is never a query state. The benchmark recipe turns it on |
-| `--max_idle_rows N` | off | Shorten every run of motionless demo rows (no arm moves, widths unchanged) to N rows and close the time gap |
-
-## Segment demonstrations into adaptive action chunks
-
-`scripts.benchmarks.segment_demos` splits raw demonstrations into
-variable-length action chunks, each fitted by one cubic B-spline with a fixed
-number of control points. Easy free-space motion gets long chunks and grasps
-get short ones. Raw files are only read; everything is written to
-`--output_dir`. The method is in `adaspevla/datasets/segmentation.py`, and
-statistics on RoboTwin are in [result.md](result.md).
-
-How a demo is split:
-
-1. Cut at keyframes: samples where every arm comes to rest, or where a gripper
-   width starts or stops changing.
-2. Give every interval a precision demand `rho` (mainly gripper activity, plus
-   optional criticality labels) and a per-sample tolerance `tolerance / rho`.
-3. Inside each keyframe interval, grow a chunk as long as its spline fit
-   (anchor-relative offsets re-anchored at the chunk start, paper teacher
-   knots) keeps every sample within tolerance, its density mass
-   `sum(rho * dt)` stays below `--mass_budget_s`, and its length stays within
-   `[--min_samples, --max_samples]`. Adjacent chunks share their boundary
-   sample, which is the next anchor.
-
-```bash
-# RoboTwin 2.0 / XPolicyLab v1.0 HDF5 (both arms, segmented jointly)
-python -m scripts.benchmarks.segment_demos --format robotwin \
-    --source_dir /path/to/RoboTwin/data/demo_clean/beat_block_hammer/aloha_agilex/data \
-    --output_dir ./data/segments/robotwin/beat_block_hammer --plot 3
-
-# RoboCasa365 LeRobot v2.1 (videos are not decoded)
-python -m scripts.benchmarks.segment_demos --format robocasa \
-    --source_dir /path/to/lerobot --output_dir ./data/segments/robocasa/<task>
-```
-
-Output: one `<episode>.segments.json` per episode (`boundaries`, `keyframes`,
-per-chunk `start`/`end`/`num_samples`/`max_residual`/`within_tolerance`/
-`knot_spans`, and per-interval `density`), `segments_summary.json`, and with
-`--plot N` a PNG for the first N episodes. Read a file back with
-`adaspevla.datasets.segmentation.load_segments`.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--num_control_points`, `--degree` | `8`, `3` | Spline per chunk |
-| `--min_samples`, `--max_samples` | `8`, `64` | Chunk length limits in samples; keyframes closer than `min_samples - 1` intervals are dropped |
-| `--tolerance` | `0.1` | Base fit tolerance in normalized units (offsets / D, gripper 2w-1); divided by `rho` |
-| `--mass_budget_s` | `3.0` | Max `sum(rho * dt)` per chunk, so a region of demand `rho` gets chunks of at most `3/rho` s |
-| `--keyframes` / `--no-keyframes` | on | Cut at stops and gripper-change edges first |
-| `--stop_fraction` | `0.05` | "At rest" = speed below this fraction of the episode's 95th-percentile speed |
-| `--gripper_eps` | `1e-3` | Width change per sample that counts as gripper motion |
-| `--gripper_gain`, `--gripper_ref` | `10`, `1` | Gripper term of `rho` (paper beta_g, e^g_ref) |
-| `--speed_gain`, `--speed_ref`, `--speed_fraction` | `0`, calibrated, `0.25` | Optional slow-motion precision term |
-| `--accel_gain`, `--accel_ref` | `0`, `1` | Optional paper e_j term (saturates on RoboTwin, so off) |
-| `--criticality_gain` | `10` | Weight of optional criticality labels |
-| `--dilation_s` | `0.15` | Spread `rho` to neighbouring samples (seconds) |
-| `--knot_density_gain` | `10` | Paper beta for the teacher knots inside a chunk |
-| `--scale_horizon` | `16` | Window length used to calibrate the motion scales D |
-| `--arms`, `--profile`, `--base_wxyz`, `--sample_dt` | `left right`, `robotwin` | RoboTwin reading options, as in the converter |
-| `--base_motion` | `drop` | RoboCasa episodes that move the mobile base |
-
----
-
-## Reference
-
-### How training works
-
-1. Prepare overlapping timestamped windows at every observation by default.
-   Each window's motion target is the offset of every sample's pose from the
-   pose at the window start (Eq. anchor_delta): `R_b^T (p - p_k)` in metres and
-   the rotation vector `R_b^T Log(R R_k^T)` in radians, in the arm base frame.
-   The first sample is therefore zero. The gripper width in [0,1] is appended
-   per arm as `2w - 1`.
-   `--supported_horizons 0.1 0.3` selects nearby observed endpoints within that
-   supported range; otherwise `--chunk_horizon 16` keeps fixed sample-count
-   windows. Windows never cross a recorded terminal sample and must span at least
-   `--control_dt`. `--pad_episode_end` repeats the final pose and width after the
-   last sample so that the last `chunk_horizon - 1` samples are anchors too.
-   `--max_idle_rows N` first shortens every run of motionless samples to N and
-   shifts later timestamps back by the removed time.
-2. Calibrate six motion scales as the 95th percentile of absolute offsets over
-   all samples of all training windows, pooling corresponding channels across
-   arms (so they depend on the horizon range). A positive floor defaults to
-   `1e-6`; calibration is frozen and checkpointed.
-3. Knot span targets use a density with a motion term (normalized second finite
-   difference of the offsets) and a separate gripper term `beta_g` on the width
-   change rate, plus optional criticality.
-4. The `action` stage trains the action predictor with flow matching over all
-   channels (motion and width) and knot span KL; there is no separate gripper
-   loss. Control-point targets are refitted on the predicted knots and detached.
-   The first control point's motion is zero in targets and in generated samples.
-   The backbone is frozen and the timing head is not updated in this stage.
-   With `--spatial_tokens`, every policy block cross-attends to a token memory:
-   the projected image tokens of every view plus a per-view embedding, one
-   pooled instruction token and, with `--proprio`, one robot-state token. The
-   robot state is normalized with statistics saved in the calibration.
-5. The optional `finetune` stage keeps the action loss and also trains the last
-   `--vision_finetune_layers` blocks of the vision encoder (plus its final layer
-   norm, and the SigLIP head or the pi0/GR00T projector) at
-   `lr × --vision_lr_scale`. The text encoder or language model stays frozen,
-   except for the last `--vlm_finetune_layers` kept layers, which train at the
-   same rate in float32.
-   Every stage has its own AdamW, warmup + cosine schedule and gradient
-   clipping at 1.0. A step whose gradient norm is not finite is skipped and
-   logged ("batch skipped") instead of turning every weight into NaN.
-6. The `timing` stage freezes the whole action predictor (including the
-   backbone), generates control points using the inference flow solver, and
-   trains only `policy.freq_head`. Inputs are context, log horizon, detached
-   spans, and probes of the planned motion and clamped width. The loss is
-   log-MSE on query intervals (`--timing_loss log_l1` for absolute error), and
-   predictions are clamped to `[--min_query_interval, --max_query_interval]`.
-7. Measured valid intervals override the fallback teacher. Fallback events at
-   sample indices `j >= 1` are acceleration magnitude `e_{j-1} >= e_crit`, any
-   arm's width crossing `theta_g = 0.5`, or criticality `>= 0.5`. The target is
-   the first event time minus a nonnegative anticipation margin, clipped to the
-   interval bounds. No event gives the maximum interval.
-
-### Backbones
-
-In spatial mode, and always for pi0, pi0.5 and GR00T, images are cropped to a
-centred square of 90% of the shorter side (a random crop with `--augment`),
-resized to the encoder's input size and normalized as that encoder expects.
-On non-square frames this drops the sides: for RoboTwin's 320×240 cameras the
-model sees only the central 216×216, and objects near the table edges are out
-of view. `--image_fit pad` instead letterboxes the whole frame to a square with
-black bars before resizing, as pi0 does. With `--augment`, the training images
-are shifted at random by up to 5% of the side, using replicate padding, instead
-of being randomly cropped. The choice is saved in the checkpoint; older
-checkpoints keep the crop.
-Model-loading failures propagate; the offline test backbone is selected only by
-`--test_backbone`.
-
-**SigLIP** (`--vlm_name google/siglip-...`): spatial mode keeps the patch tokens
-of every view and the pooled image feature; legacy mode
-(`--no-spatial_tokens`) keeps one pooled image embedding per view, preprocessed
-by the checkpoint's own processor. The instruction goes through the SigLIP text
-tower.
-
-**pi0, pi0.5, GR00T** (`--vlm_name pi0 | pi05 | gr00t`,
-`adaspevla/models/vla_backbones.py`): only the observation encoder of each
-pretrained policy is loaded (vision encoder, its projector into the language
-model, and the language model); the action experts are not.
-
-| `--vlm_name` | Weights (Hugging Face) | Language model | Attention over images + text | Instruction prompt |
-|---|---|---|---|---|
-| `pi0` | `lerobot/pi0_base` | Gemma-2B, 18 layers | Bidirectional (pi0 prefix) | `<instruction>\n` |
-| `pi05` | `lerobot/pi05_base` | Gemma-2B, 18 layers | Bidirectional | `Task: <instruction>;\nAction: ` (pi0.5 also writes the robot state there; here it is a separate token) |
-| `gr00t` | `nvidia/GR00T-N1.5-3B` | Qwen3-1.7B, first 12 layers (all GR00T keeps) | Causal, Eagle chat template | As in GR00T |
-
-All three use SigLIP-So400m/14 at 224 px (256 tokens per view) and map pixels
-to [-1, 1]. The instruction feature is the mean language-model output over the
-instruction tokens. In `joint` mode the memory holds the language-model outputs
-at the image positions; with vision fine-tuning, gradients pass through the
-frozen language model, which is recomputed layer by layer to save memory. In
-`separate` mode the memory holds the projected vision tokens and the
-instruction feature is cached per instruction. `--vlm_layers N` builds only the
-first N decoder layers (the rest are never loaded) and applies the final norm
-after layer N; with pi0.5, linear probes decode the target position best around
-layers 3–6, and N = 6 also runs a third of the language model per query.
-
-The Gemma and Qwen3 decoders are implemented in the repository and checked
-against transformers on the same weights, so these backbones run unchanged in
-the training environment and the RoboTwin evaluation environment (transformers
-4.46, which has no Qwen3). The vision encoder and projector stay float32 and
-run under autocast; the frozen language model is stored in `--vlm_dtype`. The
-Eagle tokenizer is stored in `adaspevla/models/assets/gr00t_n1_5_eagle_tokenizer/`.
-
-### Checkpoints
-
-Training saves `format_version=4`, `model_config`, `model_state`,
-`training_stage`, `step` and `calibration`, once per epoch or at least every
-2000 steps, as `adaspevla_<benchmark>_<task>_<stage>.pt` (`action`,
-`finetune`, `timing`). `*_latest.pt` is written only when the timing stage
-ends, and it is the file evaluation needs.
-
-Pretrained backbone weights that were never trained are left out of
-`model_state`: they equal the pretrained files, which the policy loads when it
-is built (so those files must be in the Hugging Face cache wherever the
-checkpoint is evaluated). Fine-tuned vision blocks and language-model layers
-are saved; the latter are rebuilt in float32 from the config. A checkpoint is
-about 100 MB plus the fine-tuned blocks (about 30 MB per SigLIP-B block, 60 MB
-per So400m block); before this, SigLIP checkpoints were 0.9 GB. Loading is strict except for those keys, so older
-checkpoints that contain every weight still load. Checkpoints trained before
-the observation options existed have none of their config keys and load as the
-pooled-feature model. Checkpoints older than format 4 must be retrained.
-
-### Action and dataset contract
-
-Episodes supply timestamped end-effector poses and gripper widths. The
-preferred layout (written by the benchmark converters) is:
-
-| Field | Meaning |
-|---|---|
-| `ee_poses` dataset | `(T, arms, 7)` poses `[x, y, z, qw, qx, qy, qz]` in the logging frame |
-| `gripper` dataset | `(T, arms)` raw widths, kept continuous |
-| `action_type` attribute | `ee_pose` |
-| `action_frame` attribute | `base` (offsets are expressed in the arm base frame) |
-| `base_wxyz` attribute | Rotation R_b from arm base to logging frame, one or one per arm (identity if omitted) |
-| `gripper_open_value`, `gripper_closed_value` | Raw width values of fully open and fully closed |
-| `sample_dt` | Positive sample period in seconds, if no `timestamps` dataset |
-
-Widths map affinely to `w` in [0,1] (0 closed, 1 open) and are never
-thresholded during training; datasets that log only a binary gripper map to
-{0, 1}. Datasets that log motion instead use `actions` `(T, 7*arms)` with
-`action_type` `twist` (m/s and axis-angle rad/s acting on `[t_j, t_{j+1})`) or
-`delta_twist` (per-step increments), followed by the raw width per arm; these are
-integrated into base-frame poses from the identity. Angular channels are
-axis-angle, **not Euler angles**.
-
-Controller-normalized commands and joint actions must be converted before
-loading. The generic loaders do not infer units or frames, pad or truncate
-actions, invent images, skip corrupt files, or substitute synthetic data after a
-loading failure.
-
-Supported HDF5 layouts:
-
-* RoboTwin: `actions` or `action`, plus `observation/head_camera/rgb` and
-  `observation/wrist_camera/rgb`.
-* RoboCasa: optional `data/demo_*` groups, `actions` or `action`, plus
-  `obs/agentview_image` (or `obs/frontview_image`) and `obs/robot0_eye_in_hand_image`.
-* Both also accept one combined image dataset via `--images_path`. RGB must be
-  uint8 or floats in [0,1], and camera/action sample counts must match. Camera
-  datasets may hold decoded RGB arrays or one encoded JPEG/PNG byte string per frame.
-
-Optional datasets are `timestamps` (seconds), `criticality`
-(values in [0,1]) and measured `query_intervals` (seconds per observation).
-Binary `terminated` or `dones` arrays and a `termination_time` attribute can mark
-an earlier episode end. Conflicting task or action metadata is rejected.
-
-Prediction returns physical `control_points` with shape `(B,K,7*num_arms)` (per
-arm six offsets in metres/radians and the unclamped width), knots, horizon and
-query interval, with `action_type="anchor_delta"`.
-
-### Using the policy in your own control loop
-
-```python
-from adaspevla.benchmarks.rollout import load_policy
-from adaspevla.execution import SynchronousSplineExecutor
-
-policy, calibration, _ = load_policy(
-    "checkpoints/robotwin_right/adaspevla_robotwin_beat_block_hammer_latest.pt", "cuda"
-)
-
-# observe() returns single-batch RGB images on the model device, instructions and,
-# for pose commands, "anchor_pose": the (arms, 7) xyz+wxyz end-effector pose
-# observed with the images. command(action) advances the robot by control_dt.
-executor = SynchronousSplineExecutor(
-    policy, observe, command, control_dt=0.02, command_type="pose",
-    world_from_base=[[0.707, 0, 0, 0.707]],  # R_b as wxyz, one per arm (conversion metadata)
-)
-for _ in range(250):
-    action, queried = executor.step()
-executor.reset()
-```
-
-Step `n` of a prefix samples the spline at `s = (n+1) control_dt / H`.
-`command_type="pose"` emits per arm the absolute target `[x,y,z,qw,qx,qy,qz,w]`
-by Eq. delta_to_target, `p = p_k + R_b a_pos`, `R = Exp(R_b a_rot) R_k`.
-`command_type="anchor_delta"` (default) emits the raw offsets and width; an
-increment or velocity controller derives its command from consecutive targets.
-The width is clamped to [0,1]; `gripper_mode="binary"` sends `1[w >= 0.5]` for
-binary grippers. The number of steps executed per query is
-`max(1, min(floor(H/control_dt), ceil(tau/control_dt)))`; horizons below one
-control period are rejected.
-
-Optional `boundary_matching=True` replaces the width entry of the new control
-point zero with the last emitted clamped width (Eq. boundary); motion needs no
-correction because each call is re-anchored. A positive `motion_limits` vector
-(one entry per motion channel) checks every planned offset before the command
-callback. Optional `stop_callback` and `fault_callback` halt execution with
-`StopIteration`. This option is off by default and still needs robot validation.
+| `adaspe_train/adaspe/` | plugin 本体：`model.py`（AdaSpePi05 模型）、`bspline.py`（B 样条、knot、timing 标签、位姿几何）、`timing_data.py`（把未来 13 帧实测 state 带进 batch） |
+| `adaspe_train/configs.py` | 训练 config（不改 OpenPI 源码，通过注册接入）。`TASK` 决定 config 名，如 `bread_adaspe_action`、`bread_adaspe_timing_from20k` |
+| `adaspe_train/train.py`、`adaspe_train/compute_norm_stats.py` | OpenPI 脚本的包装，先注册 config 再运行 |
+| `adaspe_train/calibrate_timing_anchor.py` | 标定 knot / timing 标签用的 `motion_scale` 和 `e_crit` |
+| `adaspe_train/run_train.sh` | 全流程：预检 → Action 40k → 3 个 timing |
+| `adaspe_train/run_timing_one.sh` | 单独跑一个 timing，便于多卡并行 |
+| `adaspe_train/strip_old_train_state.sh` | 磁盘不够时用：删掉旧检查点里的优化器状态，只留参数 |
+| `adaspe_train/wait_gpus_and_launch.sh` | 等 GPU 空闲再启动 |
+| `adaspe_train/tests/` | 数值等价测试、冒烟测试、数据检查、标签检查 |
+| `adaspe_train/assets/` | bread 的归一化统计（示例），以及标签检查用的参考文件 |
+| `env_patches/` | 需要放进 venv site-packages 的补丁（见下文） |
+| `reference_adaspevla_source/` | 原版 AdaSpeVLA PyTorch 代码，`tests/test_bspline_parity.py` 用它做对照 |
+
+## Recipe
+
+- OpenPI JAX，commit `215abfb`，不改上游源码。
+- 骨干 PaliGemma 从官方 `pi05_base` 加载，全量微调；不加载 π0.5 action expert。plugin 头随机初始化，seed 0。
+- 数据配置：OpenPI `LeRobotLiberoDataConfig`，`prompt_from_task=True`；state 按 π0.5 默认离散化写进 prompt；图像 `resize_with_pad` 到 224，使用默认增强。
+- 归一化统计直接用基线模型仓库里的 `norm_stats.json`（分位数归一化），用前先重算一遍，确认一致。
+- `action_horizon=13`（1.2s @10Hz），三次 B 样条 K=8（端点固定，ridge λ=1e-4），查询间隔 0.2–0.8s。
+- flow 头：隐藏层 384，6 层，6 头，cond_dim 512，ODE 15 步。flow 的目标是归一化后的原始动作。
+- knot 密度目标和 timing 标签都按原版 AdaSpeVLA 计算：
+  - 运动来自窗口内的实测位姿（相对窗口第一帧，位置差 + 旋转向量），按 `motion_scale` 归一化；
+  - 夹爪用实测开度，以 0.5 为界判断切换；
+  - timing 标签是第一次运动变化量超过 `e_crit` 或夹爪切换的时间，裁剪到 [0.2, 0.8]s。
+- 损失：Action 阶段 flow MSE + 0.5 × knot KL；timing 阶段 log-MSE。
+- global batch 32，AdamW（b1 0.9，b2 0.95，wd 1e-10，梯度裁剪 1.0），cosine（warmup 1k，peak 2.5e-5，decay 30k，end 2.5e-6），EMA 0.99，评测用 EMA 参数。
+- Action 训练 40k 步，保留 10k/20k/30k/40k。然后基于 20k/30k/40k 各训练一个 timing 头：10k 步，只训练 `freq_head`，其余全部冻结。
+- 每 1000 步存一次检查点，wandb 关闭，FSDP 设备数等于 GPU 数。
+
+## 环境搭建
+
+1. 克隆 OpenPI 并切到 `215abfb`，`uv sync --frozen --python 3.11`。缺内核头文件时加 `--no-install-package evdev`。
+2. 把 `env_patches/` 里的 `datasets_list_shim.py` 和 `datasets_list_shim.pth` 放进 `external/openpi/.venv/lib/python3.11/site-packages/`：让 datasets 3.6 认识 `List` 特征（训练、norm stats 和检查脚本都要用）。不要把 datasets 升级到 4.x。
+   仓库里的脚本自己会找到 `adaspe_train/`，不需要别的路径补丁。只有在仓库外的代码里 `import configs`（比如自己写的 policy server）时，才需要在仓库根目录运行一次：
+   `echo "$PWD/adaspe_train" > external/openpi/.venv/lib/python3.11/site-packages/adaspe_train_path.pth`
+3. PaliGemma tokenizer 要预先下载到 HF cache。脚本默认离线运行（`HF_HUB_OFFLINE=1`）。
+
+## 路径
+
+代码里没有写死的路径：所有脚本都从自己所在的位置推出仓库根目录（Python 用 `__file__`，shell 用 `BASH_SOURCE`），仓库放在哪里都可以，不用改路径。
+
+根目录（即本仓库）下应有的布局，每一项都可以是软链接（比如指到更大的磁盘）：
+- `external/openpi`：OpenPI 和 venv
+- `adaspe_train`：这份代码
+- `reference_adaspevla_source`：原版 AdaSpeVLA 代码（数值等价测试用；也可以用环境变量 `ADASPEVLA_REF` 指定别的位置）
+- `data/lerobot/<repo_id>`：LeRobot 数据集
+- `checkpoints/`：训练输出
+- `test/franka/<实验名>/`：日志
+- `.cache/`：HF、JAX 等缓存
+
+`pi05_base` 参数默认在 `.cache/openpi/openpi-assets/checkpoints/pi05_base/params`（`configs.py` 的 `PI05_BASE`）。
+
+## 换成新任务要改的地方
+
+两个任务的格式和 bread 一致：两路 128×128 图像，19 维 state，7 维动作，10Hz，各只有一条 task 文本。
+
+| 任务 | 数据集（revision） | 基线模型（revision） | 基线 norm_stats 在仓库里的路径 |
+|---|---|---|---|
+| insert-tube | `dddddsds31341/insert-tube-lerobot`（`70bcd1f86ed35fc93a0422a564472355242a51ab`），102 条 / 16,403 帧 | `dddddsds31341/Franka-Insert-Tube-pi05-step-20000`（`e97d90f5bed133b24e8de4189eb25254641e69cf`） | `assets/bofang/insert-tube-lerobot/norm_stats.json` |
+| wipe-whiteboard | `dddddsds31341/wipe-whiteboard-lerobot`（`2c8cfa8ddef1f83cb09ca7881a0944cd637cd6d0`），112 条 / 29,795 帧 | `dddddsds31341/Franka-Wipe-Whiteboard-pi05-step-20000`（`628df08d8cea3965d8a5ece6f57a8f60dd242c2e`） | `assets/bofang/wipe-whiteboard-lerobot/norm_stats.json` |
+
+1. **configs.py**
+   - `REPO_ID` 改成新数据集。
+   - 把基线的 `norm_stats.json` 放到 `adaspe_train/assets/baseline/<REPO_ID>/norm_stats.json`。注意基线仓库里的目录名是 `bofang/...`，要按我们的 `REPO_ID` 放。
+   - `TASK` 改成新任务名（如 `insert_tube`），config 名会跟着变。检查点放在 `checkpoints/adaspe/<TASK>_adaspe_*`，不会和别的任务混在一起。
+2. **重新标定，不能沿用 bread 的数**（只读数据，CPU 上运行）：
+   - 改 `calibrate_timing_anchor.py` 里的 parquet 路径，然后运行。
+   - 把输出的 `motion_scale` 和 `e_crit` 填进 `configs.py` 的 `TIMING_MOTION_SCALE` 和 `TIMING_E_CRIT`。
+   - 记录标签分布，即 0.2s、0.8s 各占多少。
+3. **核对 state 含义**。代码假设：
+   - `state[0]` 是夹爪开度（开 1，合 0）；
+   - `state[4:7]` 是位置；
+   - `state[7:10]` 是 Euler xyz（scipy "xyz"）。
+
+   先用 `tests/check_data.py` 和几条 episode 确认新数据也是这样。wipe-whiteboard 可能全程拿着板擦，夹爪不开合；这不影响训练，只是 timing 事件全部来自运动。
+4. **run 脚本**：运行时设置环境变量 `TASK`，要和 `configs.py` 里的 `TASK` 一致。日志默认写到 `test/franka/<TASK>_adaspe/`。
+5. `tests/check_timing_labels.py` 依赖 `assets/timing_labels/<TASK>_H<H>.npy`。先用新任务的数据运行 `calibrate_timing_anchor.py` 重新生成这个文件，再跑检查。
+
+## 运行顺序
+
+1. 重算 norm stats，和基线逐位比较：`python adaspe_train/compute_norm_stats.py --config-name pi05_<TASK>_franka_ref`
+2. 标定（见上文）。
+3. CPU 测试：
+   - `tests/test_bspline_parity.py`：和原版的误差 ≤1e-12；
+   - `tests/smoke_model.py`；
+   - `tests/check_data.py`；
+   - `tests/check_timing_labels.py`：0 处不一致。
+4. 预检和正式训练：`CUDA_VISIBLE_DEVICES=<卡> TASK=<任务名> bash adaspe_train/run_train.sh`。可以先设 `PREFLIGHT_ONLY=1`，只跑预检：训练 30 步，再从断点续训，确认 loss 有限、续训正常。
+5. timing 想并行的话，Action 跑完后每个 timing 用一张卡：`CUDA_VISIBLE_DEVICES=4 TASK=<任务名> bash adaspe_train/run_timing_one.sh 20`，30、40 同理。
+
+注意：Action 开始后不要改卡数。检查点只能在保存时的同样卡数上续训；global batch 32 要能被卡数整除，所以用 1、2 或 4 张卡。
+
+## 交付时请给我
+
+- 最终的 Action（20k/30k/40k）和 timing EMA 参数，以及所有文件的 sha256；
+- loss 曲线；
+- 实际用的 config 导出、标定出的 `motion_scale` / `e_crit`、标签分布、git commit；
+- 和本文档不一致的地方，逐条列出。
+
+## Jean Zay 上的配置（2026-11-10）
+
+只在 Jean Zay 上用。别的机器不需要 `adaspe_train/slurm/`，直接用 `run_train.sh` / `run_timing_one.sh`。
+
+- WORK 的 inode 配额紧张，所以 `external/`（OpenPI `215abfb` + uv venv）、`data/`、`checkpoints/`、`.cache/` 都是指向 `$SCRATCH/adaspevla_train/` 的软链接。SCRATCH 上 30 天不访问的文件会被清掉，交付用的参数要拷走。
+- 任务由环境变量 `TASK` 选择（`bread` / `insert_tube` / `wipe_whiteboard`），各任务的 `REPO_ID`、`motion_scale`、`e_crit` 写在 `adaspe_train/tasks.py`；`configs.py`、标定脚本和测试都从这里读，不用再手改 `configs.py`。还没标定的任务只注册 `pi05_<TASK>_franka_ref`。
+- 标定结果：`assets/calibration/<TASK>_H<H>.json`；标签文件：`assets/timing_labels/<TASK>_H<H>.npy`（原 bread 的 `timing_labels_measured.npy` 保留不动，是 H=13 旧 recipe 的）。标定命令：`TASK=<任务> python adaspe_train/calibrate_timing_anchor.py`，结果要抄进 `tasks.py`（标定和 check 用的都是 `adaspe/labels.py` 里和训练相同的标签函数）。
+- `pi05_base`：`.cache/openpi/openpi-assets/checkpoints/pi05_base/params`（官方 GCS，与 bucket 列表逐文件核对过大小）。tokenizer 在 `.cache/openpi/big_vision/paligemma_tokenizer.model`（OpenPI 从 `OPENPI_DATA_HOME` 读，不是 HF cache）。
+- 计算节点不联网，所有数据/权重都在本地；脚本里 `unset PYTHONPATH LD_LIBRARY_PATH`、`PYTHONNOUSERSITE=1`，避免模块和 `~/.local` 混进 venv。
+- SLURM（`adaspe_train/slurm/`）：都要在仓库根目录提交（SLURM 运行的是脚本的副本，根目录和日志路径都取提交目录），账号用 `-A <账号>` 给，脚本里不写账号。
+  - `prep_checks.slurm`：CPU 上跑 norm stats 重算+比较、parity、smoke、check_data、check_timing_labels（两个任务）。
+  - `preflight.slurm`：H100 dev，4 卡单独跑 preflight，作业名必须是 `adaspe-pf-<TASK>`，写 `preflight_passed`（可选：dev QoS 全集群共用 128 卡，常排不上；`train_task.slurm` 第一节自己会先跑 preflight，失败就停链）。
+  - `train_task.slurm`：H100 t3 20 h 一节的链式作业（singleton，自动排下一节，最后一节或真失败时取消）。4 卡 FSDP 4 跑 Action 40k，然后 3 个 timing 各占一张卡并行。
+    `sbatch -A <账号> --job-name=adaspe-insert_tube --export=ALL,TASK=insert_tube adaspe_train/slurm/train_task.slurm`（后面各节自动用同一个账号）
+  - 日志：`test/franka/<作业名>-<id>.out` 和 `test/franka/<TASK>_adaspe/`。
+
+## Recipe 修订（2026-11-10，和上面 "Recipe" 不同的地方）
+
+开关都在 `adaspe_train/tasks.py`，方括号里是原值；改回原值并重新标定即可复现原 recipe（`adaspe/labels.py` 在原设置下和旧标签逐个一致，0 处不一致）。
+
+| 项 | 现在 | 原来 | 原因（两个任务的数据） |
+|---|---|---|---|
+| `ACTION_HORIZON` | 16（1.5 s） | 13（1.2 s） | 13 没有必须的理由；16 拟合误差配 K=11 反而更小 |
+| `NUM_CONTROL_POINTS` | 11 | 8 | 归一化动作的位姿 RMSE 0.024/0.021（原 0.029/0.025） |
+| query interval | 0.2–1.5 s（上限 = horizon） | 0.2–0.8 s | 原上限 72–76% 的标签被顶住，并且强制截掉 chunk 后 1/3 |
+| 夹爪事件（timing 标签、knot 密度） | 夹爪**命令**的开/合状态 | 实测开度过 0.5 | 实测开度比命令晚中位 19 帧（~1.9 s，前 ~1.4 s 完全不动，机械臂静止），超过 chunk 长度 |
+| knot 密度 | `1 + 10·tanh(mv / e_crit)` | `1 + 10·tanh(mv)` | 原公式 tanh 在 68–73% 的帧间隔饱和，62–63% 的窗口 knot 目标近似均匀；现在 3–4% |
+| 推理 `sample_spline` | 返回 `execute_steps` 和 `dense_actions`：前缀至少执行到预测的夹爪切换 | 只有 query interval | 静止时下一帧观测不变，切换若落在前缀之后会被一直推后 |
+
+标定（H=16）：insert-tube `e_crit` 11.98，标签 0.2 s 12.0% / 1.5 s 54.6%；wipe-whiteboard `e_crit` 8.96，0.2 s 10.2% / 1.5 s 60.0%。
+在开爪命令处，样条在命令那一帧的值中位数 +0.93 / +0.98（均匀 knot 时 +0.66）。
+
+另外修了一个原代码里的 bug：`configs.py` 里 `import openpi.models.model as _model` 被后面的 `def _model(stage)` 覆盖，两个 weight loader 调 `_model.restore_params` 会在训练开始时报 `AttributeError`。现在模块别名是 `_openpi_model`，config 函数叫 `model_config`。
+
+部署（不在本仓库）：客户端调用 `sample_spline`，执行 `dense_actions[:, :execute_steps]`（每步一个 0.1 s 的增量命令），然后重新观测、推理。
