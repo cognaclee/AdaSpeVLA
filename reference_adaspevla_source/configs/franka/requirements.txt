@@ -1,0 +1,3 @@
+# In addition to the existing AdaSpeVLA environment.
+pyarrow>=14
+huggingface_hub>=0.20

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "verified": false,
+  "evidence": "CANDIDATE ONLY: public SERL layout matches numerical grouping; exact collector and per-episode reset transforms are not available.",
+  "supervision": "measured_pose",
+  "pose_frame": "reset",
+  "position_indices": [4, 5, 6],
+  "orientation_indices": [7, 8, 9],
+  "orientation": "euler_xyz",
+  "position_unit": "m",
+  "angle_unit": "rad",
+  "state_scale": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+  "state_offset": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+  "gripper_index": 0,
+  "gripper_open": 1.0,
+  "gripper_closed": 0.0,
+  "gripper_clip_tolerance": 0.0
+}

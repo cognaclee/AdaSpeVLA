@@ -1,0 +1,35 @@
+{
+  "name": "franka_single_tennis-balls",
+  "reference": "jiale_benchmark v4 formal recipe: batch64; warmup min(500, stage_steps//10); user requests independent tasks and 4000+1000 steps",
+  "task_names": [
+    "tennis-balls"
+  ],
+  "chunk_horizon": 13,
+  "num_control_points": 11,
+  "degree": 3,
+  "control_dt": 0.1,
+  "min_query_interval": 0.2,
+  "max_query_interval": 0.8,
+  "action_steps": 4000,
+  "timing_steps": 1000,
+  "local_batch": 64,
+  "world_size": 1,
+  "seed": 0,
+  "lr": 0.0002,
+  "weight_decay": 0.0001,
+  "gradient_clip": 1.0,
+  "warmup_steps": 500,
+  "save_every": 1000,
+  "log_every": 50,
+  "supervision": "measured_pose",
+  "action_frame": "episode_reset",
+  "split": "all513_no_holdout",
+  "pad_episode_end": true,
+  "sampling": "uniform windows within task with replacement",
+  "status": "prepared; GPU validation and formal training pending",
+  "warmup_rule": "min(warmup_steps, stage_steps // 10)",
+  "effective_warmup_steps": {
+    "action": 400,
+    "timing": 100
+  }
+}
