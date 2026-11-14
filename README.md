@@ -20,7 +20,7 @@
 | `adaspe_train/tests/` | 数值等价测试、冒烟测试、数据检查、标签检查 |
 | `adaspe_train/assets/` | bread 的归一化统计（示例），以及标签检查用的参考文件 |
 | `env_patches/` | 需要放进 venv site-packages 的补丁（见下文） |
-| `reference_adaspevla_source/` | 原版 AdaSpeVLA PyTorch 代码，`tests/test_bspline_parity.py` 用它做对照 |
+| `reference_adaspevla_source/` | 原版 AdaSpeVLA PyTorch 代码，`tests/test_bspline_parity.py` 用它做对照。**不在公开仓库里**，需要自己放到这里，或用环境变量 `ADASPEVLA_REF` 指定位置 |
 
 ## Recipe
 
@@ -54,7 +54,7 @@
 根目录（即本仓库）下应有的布局，每一项都可以是软链接（比如指到更大的磁盘）：
 - `external/openpi`：OpenPI 和 venv
 - `adaspe_train`：这份代码
-- `reference_adaspevla_source`：原版 AdaSpeVLA 代码（数值等价测试用；也可以用环境变量 `ADASPEVLA_REF` 指定别的位置）
+- `reference_adaspevla_source`：原版 AdaSpeVLA 代码（数值等价测试用，不在公开仓库里；也可以用环境变量 `ADASPEVLA_REF` 指定别的位置）
 - `data/lerobot/<repo_id>`：LeRobot 数据集
 - `checkpoints/`：训练输出
 - `test/franka/<实验名>/`：日志
@@ -144,3 +144,55 @@
 另外修了一个原代码里的 bug：`configs.py` 里 `import openpi.models.model as _model` 被后面的 `def _model(stage)` 覆盖，两个 weight loader 调 `_model.restore_params` 会在训练开始时报 `AttributeError`。现在模块别名是 `_openpi_model`，config 函数叫 `model_config`。
 
 部署（不在本仓库）：客户端调用 `sample_spline`，执行 `dense_actions[:, :execute_steps]`（每步一个 0.1 s 的增量命令），然后重新观测、推理。
+
+## Timing 标签怎么算（当前 recipe，H=16）
+
+timing 头预测**查询间隔** q ∈ [0.2, 1.5] s：当前 chunk 执行多久之后重新观测、推理。标签的意思是"离下一个事件还有多久"：快有事发生（急加减速、夹爪开合）就早点重新推理，动作平稳就把整个 chunk 执行完。
+
+对每个训练帧 t，取未来 16 帧 t … t+15（dt = 0.1 s）的**实测** state 窗口。episode 末尾不够 16 帧时重复最后一帧（LeRobot 的 clamp，相当于停在终点）：
+
+1. **相对位姿**：实测末端位姿 `state[4:10]`（xyz + Euler xyz，scipy `"xyz"`）换成相对第 t 帧的偏移：位置 `p_j − p_t`，旋转 `Log(R_j R_tᵀ)`（旋转向量），共 6 维。每维除以 `motion_scale`，即该维 |偏移| 在全数据集上的 95 分位数，得到无量纲的运动量。
+2. **运动变化量**：差分求速度 `v = Δ偏移 / dt`，再求加速度的模 `a_i = ‖Δv / dt‖`。`a_i` 用到第 i、i+1、i+2 帧，记在第 i+1 帧（时间 0.1·(i+1) s）；最后一个间隔复制前一个。见 `bspline.motion_variation`。
+3. **事件**：
+   - 运动事件：`a_i ≥ e_crit`。`e_crit` 是 `a` 在全数据集上的 95 分位数，即数据里最剧烈的 5% 加速度（insert-tube 11.98，wipe-whiteboard 8.96）。
+   - 夹爪事件：夹爪**命令**的开/合状态在相邻两帧之间切换。命令是 −1 合 / +1 开 / 0 不变；0 沿用前一个非零命令，窗口开头没有非零命令时用后一个，全是 0 就不产生事件。不用实测开度，因为开度比命令晚约 1.9 s（见上表）。
+4. **标签** `y` = 第一个事件的时间（0.1, 0.2, …, 1.5 s），裁剪到 [0.2, 1.5]；窗口内没有事件时 `y = 1.5`。例如机械臂平稳移动，0.7 s 后为抓取急刹，则 `y = 0.7`。
+
+标签分布：insert-tube 0.2 s 12.0%、1.5 s 54.6%，其余在 0.3–1.4 s 之间大致均匀；wipe-whiteboard 0.2 s 10.2%、1.5 s 60.0%。
+
+实现：标签在训练时由模型在线计算（`adaspe/labels.py` 的 `timing_target` → `event_inputs`，`adaspe/bspline.py` 的 `query_interval_target`、`motion_variation`、`measured_anchor_offsets`）。实测窗口由 `adaspe/timing_data.py` 写进 action 的补零通道 7–13；flow 头和 knot 头不读这些通道。`motion_scale` / `e_crit` 由 `calibrate_timing_anchor.py` 标定（写进 `tasks.py`），它用同一套标签函数生成 `assets/timing_labels/<TASK>_H16.npy`，`tests/check_timing_labels.py` 对比训练管线的标签：0 处不一致。knot 密度目标用的是同样的归一化运动量和夹爪命令（`labels.knot_span_target`）。
+
+**timing 头和损失**（`adaspe/model.py` 的 `timing_interval`、`compute_loss` 里 `stage == "timing"` 的分支）：
+- 输入（全部 stop-gradient）：pooled 观测特征 `cond`（512）、log horizon、8 个 knot 间隔、预测样条在 16 个时刻的值 ×7（6 维运动 + 夹爪开/合）。共 633 维，经过 MLP 633 → 128 → 1 得到 z，`q = 0.2 + 1.3·sigmoid(z)`。
+- 损失：`(log q − log y)²` 的 batch 平均。在 log 空间算，误差是相对的：0.2 预测成 0.4 和 1.5 预测成 0.75 的代价一样。损失 L 对应典型误差倍数 `exp(√L)`。常数预测的损失 = Var(log y) ≈ 0.52（insert-tube）/ 0.47（wipe-whiteboard），即约 2.1 倍。
+- 难点：标签来自未来的**实测**加速度（接触、刹车、示教里的抖动），当前图像不能完全决定它；而头只能看到模型预测的命令样条，不是实测轨迹。所以损失有一部分降不下去。
+- 推理：执行 `ceil(q / 0.1)` 步；如果 chunk 里预测有夹爪切换，至少执行到切换之后（`sample_spline`）。
+
+学习率（2026-11-14）：原 recipe 的 timing 阶段沿用 OpenPI 默认 LR（peak 2.5e-5，decay 30k），但只训练 10k 步，所以 LR 一直在 2.0–2.5e-5，对一个新初始化的小 MLP 偏小。新加的 config `<TASK>_adaspe[_expert]_timing_from40k_lr{3e-4,1e-3}`（`configs.TIMINGS_LR`，`slurm/timing_lr.slurm`）同样 10k 步、warmup 1k，cosine 衰减到 peak/10。按 episode 留出 20% 做验证（`adaspe_train/lr_check.py`，在 `dump_timing_features.py` 导出的特征上离线重放 timing 阶段），insert-tube 第 10k 步的留出损失：
+
+| LR | flow_head | expert |
+|---|---|---|
+| 2.5e-5（原） | 0.217 | 0.292 |
+| **3e-4** | **0.195** | **0.270** |
+| 1e-3 | 0.216（过拟合，训练损失 0.088） | 0.265（训练损失 0.089） |
+
+部署用 `lr3e-4`。wipe-whiteboard 的留出验证还没做。
+
+## 变体：pi0.5 action expert 生成控制点（2026-11-13，`VARIANT=expert`）
+
+动机：真机上 π0.5 基线的精度明显好于 AdaSpeVLA。两者的最大差别在生成动作的部分。AdaSpeVLA 用 20.4 M 的 flow 头，从零训练，只看 backbone 最后一层投影后的 token；π0.5 的 Gemma-300M expert 有 311 M transformer 参数，另有 117 M adaRMS 时间调制层，在 `pi05_base` 里预训练过，每一层都 attend 到 backbone 的 KV。原插件加载时把它丢掉了。样条本身不是瓶颈：用本 recipe 的样条（H=16、K=11）拟合 demo，9 步前缀累计误差的 p95 ≤ 一个典型步长的 5%（慢速阶段也一样）。
+
+做法（`adaspe/model.py` 的 `generator="pi05_expert"`；默认的 `"flow_head"` 代码和参数初始化都不变，旧检查点照常用）：
+- 网络是完整的 π0.5（PaliGemma + action expert），`pi05_base` 的全部权重都加载。`PluginWeightLoader` 会检查 expert 和 `action_in_proj` / `action_out_proj` / `time_mlp_*` 是否齐全、形状是否一致，缺一个就报错。
+- expert 的输入是 K=11 个控制点 token，π0.5 原本是 action token。token = `action_in_proj(带噪控制点，按 OpenPI 补零到 32 维)` + `cp_knot_proj(该控制点 Greville 位置的 sin-cos 编码、knot 向量、log horizon)`。`cp_knot_proj` 初始化为 0，所以第 0 步 expert 收到的输入和 π0.5 完全一样。
+- flow 按 π0.5 的约定：t=1 是噪声，时间采样 Beta(1.5, 1)，ODE 10 步（timing 阶段取特征也用 10 步）。adaRMS 时间调制、attention mask、位置编码和 KV cache 的用法都照搬 `Pi0`。
+- knot 要从 prefix 预测，所以先单独跑一遍 prefix 拿 KV cache，再跑 expert（和 π0.5 推理时一样）。梯度穿过 KV cache，所以训练等价于 π0.5 的 prefix+suffix 联合前向（`tests/test_expert_parity.py` 有对比）。
+- 不变的部分：knot 头、timing 头、标签、样条拟合、损失（flow MSE + 0.5 × knot KL）、数据、norm stats、40k 步、保留 10k/20k/30k/40k、timing 阶段。
+
+运行：和原变体一样，`--export` 里加 `VARIANT=expert`，作业名前缀用 `adaspe-expert-`。原变体是 `adaspe-`，两个变体的作业链互不干扰：
+```
+sbatch -A <账号> --qos=qos_gpu_h100-dev --time=02:00:00 --job-name=adaspe-expert-dev-insert_tube \
+    --export=ALL,TASK=insert_tube,VARIANT=expert adaspe_train/slurm/train_task.slurm
+```
+config：`<TASK>_adaspe_expert_action`、`<TASK>_adaspe_expert_timing_from{20,30,40}k`。日志在 `test/franka/<TASK>_adaspe_expert/`，检查点在 `checkpoints/adaspe/<TASK>_adaspe_expert_*`。名字统一由 `adaspe_train/names.sh` 生成。
+测试（CPU）：`tests/test_expert_parity.py`、`tests/smoke_model.py`（两种 generator 都测）、`tests/check_config_names.py`，都在 `slurm/prep_checks.slurm` 里。
