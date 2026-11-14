@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "verified": true,
+  "evidence": "User-supplied Documents/真机/166.PNG and 167.PNG plus collect.py; SHA256 below",
+  "supervision": "measured_pose",
+  "pose_frame": "reset",
+  "position_indices": [
+    4,
+    5,
+    6
+  ],
+  "orientation_indices": [
+    7,
+    8,
+    9
+  ],
+  "orientation": "euler_xyz",
+  "position_unit": "m",
+  "angle_unit": "rad",
+  "state_scale": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "state_offset": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "gripper_index": 0,
+  "gripper_open": 1.0,
+  "gripper_closed": 0.0,
+  "gripper_clip_tolerance": 0.1,
+  "output_frame": "episode_reset",
+  "evidence_sha256": {
+    "Documents/真机/collect.py": "0b9812c602b0e277e13bfcb23f0d9e7bb5473d168635fb0ada60e32ff59e07ed",
+    "Documents/真机/166.PNG": "db1c623e15d4cfa5728a8e443f14bc51186ef1935b2c4aafda3fe7627147024c",
+    "Documents/真机/167.PNG": "3c601d44aa2f3fcf3a47983e65bfd4b20dc3df9f4878d77181fa9363cbb7b906"
+  },
+  "controller": {
+    "action_frame": "current_end_effector",
+    "translation_scale_m": 0.023,
+    "rotation_scale_rad": 0.095,
+    "rotation_representation": "rotvec",
+    "gripper_scale": 1.5,
+    "gripper_threshold": 0.5,
+    "zero_gripper_command": "hold_no_new_command"
+  },
+  "timing": "state/images are observations_t, action_t precedes next_observations; timestamp is nominal 10Hz export time"
+}

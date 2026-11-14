@@ -1,0 +1,17 @@
+robotwin	beat_block_hammer
+robotwin	hanging_mug
+robotwin	stamp_seal
+robotwin	place_phone_stand
+robotwin	stack_blocks_three
+robotwin	handover_block
+robotwin	open_microwave
+robotwin	press_stapler
+robocasa	CoffeeSetupMug
+robocasa	TurnOnSinkFaucet
+robocasa	TurnOffStove
+robocasa	TurnOnMicrowave
+robocasa	OpenDrawer
+robocasa	CloseFridge
+robocasa	PickPlaceCounterToCabinet
+robocasa	PickPlaceToasterToCounter
+robocasa	SlideDishwasherRack
